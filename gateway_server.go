@@ -76,6 +76,11 @@ type GatewayConfig struct {
 	LiquidationURL      string        // URL of the liquidation service endpoint
 	LiquidationInterval time.Duration // How often to poll the liquidation service
 	LiquidationEnabled  bool          // Whether to enable liquidation polling
+
+	// Nostr relay configuration for quote lookup
+	NostrRelayURL string // URL of the Nostr relay HTTP API
+	OraclePubkey  string // Oracle's Schnorr public key for Nostr events (32 bytes hex)
+	ChainNetwork  string // Chain network identifier (e.g., "mutiny", "mainnet")
 }
 
 // IPRateLimiter manages per-IP rate limiters with automatic cleanup
@@ -251,6 +256,9 @@ type GatewayServer struct {
 	// Replay protection: maps event_id -> timestamp
 	processedWebhooks      map[string]time.Time
 	processedWebhooksMutex sync.RWMutex
+	// Quote caching for new flow
+	quoteCache  *QuoteCache
+	nostrClient *NostrClient
 }
 
 // isWebhookReplayed checks if a webhook has already been processed (replay attack prevention)
@@ -302,6 +310,47 @@ func (s *GatewayServer) cleanupWebhookCache() int {
 		}
 	}
 	return cleaned
+}
+
+// cacheWebhookPrice extracts price data from a webhook and caches it for quote lookups.
+// This enables the new flow where quotes can be served from cache + Nostr without CRE calls.
+func (s *GatewayServer) cacheWebhookPrice(payload *WebhookPayload) {
+	if payload == nil || payload.Content == "" {
+		return
+	}
+
+	// Try to parse as PriceContractResponse
+	var priceContract PriceContractResponse
+	if err := json.Unmarshal([]byte(payload.Content), &priceContract); err != nil {
+		s.logger.Debug("Could not parse webhook content as price contract (ignoring)",
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Only cache if we have valid price data
+	if priceContract.BasePrice <= 0 || priceContract.BaseStamp <= 0 {
+		s.logger.Debug("Invalid price data in webhook (ignoring)",
+			zap.Int64("base_price", priceContract.BasePrice),
+			zap.Int64("base_stamp", priceContract.BaseStamp),
+		)
+		return
+	}
+
+	// Update the price cache
+	s.quoteCache.SetPrice(uint32(priceContract.BasePrice), uint32(priceContract.BaseStamp))
+	s.logger.Debug("Cached price from webhook",
+		zap.Int64("base_price", priceContract.BasePrice),
+		zap.Int64("base_stamp", priceContract.BaseStamp),
+	)
+
+	// Also cache the full quote if we have a commit_hash
+	if priceContract.CommitHash != "" {
+		s.quoteCache.SetQuote(priceContract.CommitHash, &priceContract)
+		s.logger.Debug("Cached quote from webhook",
+			zap.String("commit_hash", priceContract.CommitHash),
+		)
+	}
 }
 
 // Request tracking
@@ -635,6 +684,12 @@ type PriceContractResponse struct {
 	TholdPrice int64   `json:"thold_price"` // Threshold price
 }
 
+// QuoteResponse extends PriceContractResponse with collateral ratio for frontend
+type QuoteResponse struct {
+	PriceContractResponse
+	CollateralRatio float64 `json:"collateral_ratio"` // Collateral ratio as percentage (e.g., 135.0 for 135%)
+}
+
 // Response types
 type SyncResponse struct {
 	Status    string                 `json:"status"` // "completed", "timeout"
@@ -708,6 +763,8 @@ func init() {
 		ipRateLimiter:     NewIPRateLimiter(config.IPRateLimit, config.IPBurstLimit),
 		circuitBreaker:    NewCircuitBreaker(5, 30*time.Second),
 		processedWebhooks: make(map[string]time.Time),
+		quoteCache:        NewQuoteCache(),
+		nostrClient:       NewNostrClient(config.NostrRelayURL, config.OraclePubkey, logger),
 	}
 
 	logger.Info("Gateway server initialized",
@@ -721,6 +778,8 @@ func init() {
 		zap.Bool("liquidation_enabled", config.LiquidationEnabled),
 		zap.String("liquidation_url", config.LiquidationURL),
 		zap.Duration("liquidation_interval", config.LiquidationInterval),
+		zap.String("nostr_relay_url", config.NostrRelayURL),
+		zap.String("chain_network", config.ChainNetwork),
 	)
 
 	// Start cleanup goroutine
@@ -875,6 +934,32 @@ func loadConfig() *GatewayConfig {
 		config.LiquidationEnabled = true // Enabled by default
 	} else {
 		config.LiquidationEnabled = liquidationEnabled == "true" || liquidationEnabled == "1"
+	}
+
+	// Nostr relay configuration for quote lookup
+	config.NostrRelayURL = os.Getenv("NOSTR_RELAY_URL")
+	if config.NostrRelayURL == "" {
+		config.NostrRelayURL = "https://relay.ducat.dev" // Default
+	}
+
+	config.OraclePubkey = os.Getenv("ORACLE_PUBKEY")
+	if config.OraclePubkey == "" {
+		// In production, this should be set - use test default for development
+		config.OraclePubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+		logWarn("ORACLE_PUBKEY not set - using test default")
+	} else {
+		// Validate format: must be exactly 64 hex characters
+		if len(config.OraclePubkey) != 64 {
+			logFatal("ORACLE_PUBKEY must be 64 hex characters (32 bytes), got %d", len(config.OraclePubkey))
+		}
+		if _, err := hex.DecodeString(config.OraclePubkey); err != nil {
+			logFatal("ORACLE_PUBKEY invalid hex: %v", err)
+		}
+	}
+
+	config.ChainNetwork = os.Getenv("CHAIN_NETWORK")
+	if config.ChainNetwork == "" {
+		config.ChainNetwork = "mutiny" // Default to mutiny testnet
 	}
 
 	return config
@@ -1037,21 +1122,22 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// handleCreate handles GET /api/quote?th=PRICE requests by creating a tracked threshold request,
-// triggering the CRE workflow, and blocking until a matching webhook arrives or the server timeout elapses.
+// handleCreate handles GET /api/quote?th=PRICE requests using the new flow:
+// 1. Get cached price data from webhooks
+// 2. Calculate commit_hash locally (d-tag)
+// 3. Try local cache first
+// 4. Try Nostr relay lookup
+// 5. Fall back to CRE workflow if quote not found
 //
-// It validates the required `th` query parameter (must be a positive number), enqueues a PendingRequest
-// (rejecting with 503 if the server is at capacity), and invokes the external workflow. If a matching
-// webhook is received before the timeout, the handler returns the webhook's CRE `PriceContractResponse`
-// as JSON. If the wait times out, the handler responds with 202 Accepted and a SyncResponse containing
-// the request ID for polling via GET /status/{request_id}.
+// This flow is optimized for serving pre-baked quotes from Nostr, avoiding CRE calls
+// when possible. The response includes collateral_ratio calculated from prices.
 //
 // Observed HTTP behaviors:
-//   - 200: successful CRE response returned as JSON.
-//   - 202: request timed out; polling instruction returned.
+//   - 200: successful quote response with collateral_ratio.
+//   - 202: request timed out waiting for CRE (fallback path).
 //   - 400: missing or invalid `th` parameter.
 //   - 405: method not allowed (only GET and OPTIONS supported).
-//   - 500: failure to trigger the CRE workflow.
+//   - 500: internal error (no cached price, calculation failure, etc).
 //   - 503: server at capacity (too many pending requests).
 func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Set restrictive CORS headers - only allow configured origins
@@ -1097,6 +1183,90 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tholdPrice := uint32(th)
+
+	// Step 1: Get cached price data
+	cachedPrice := s.quoteCache.GetPrice()
+	if cachedPrice == nil {
+		s.logger.Warn("No cached price data available, falling back to CRE")
+		s.fallbackToCRE(w, th)
+		return
+	}
+
+	s.logger.Debug("Using cached price",
+		zap.Uint32("base_price", cachedPrice.BasePrice),
+		zap.Uint32("base_stamp", cachedPrice.BaseStamp),
+	)
+
+	// Step 2: Calculate commit_hash locally (d-tag for Nostr lookup)
+	commitHash, err := CalculateCommitHash(
+		s.config.OraclePubkey,
+		s.config.ChainNetwork,
+		cachedPrice.BasePrice,
+		cachedPrice.BaseStamp,
+		tholdPrice,
+	)
+	if err != nil {
+		s.logger.Error("Failed to calculate commit_hash",
+			zap.Error(err),
+		)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	s.logger.Debug("Calculated commit_hash",
+		zap.String("commit_hash", commitHash),
+		zap.Uint32("thold_price", tholdPrice),
+	)
+
+	// Step 3: Try local cache first
+	if quote := s.quoteCache.GetQuote(commitHash); quote != nil {
+		s.logger.Info("Quote served from local cache",
+			zap.String("commit_hash", commitHash),
+		)
+		collateralRatio := CalculateCollateralRatio(cachedPrice.BasePrice, tholdPrice)
+		s.sendQuoteResponse(w, quote, collateralRatio)
+		return
+	}
+
+	// Step 4: Try Nostr relay lookup
+	quote, err := s.nostrClient.FetchQuoteByDTag(commitHash)
+	if err != nil {
+		s.logger.Warn("Failed to fetch quote from Nostr relay",
+			zap.String("commit_hash", commitHash),
+			zap.Error(err),
+		)
+		// Fall through to CRE fallback
+	} else if quote != nil {
+		// Found in Nostr! Cache it and return
+		s.quoteCache.SetQuote(commitHash, quote)
+		s.logger.Info("Quote served from Nostr relay",
+			zap.String("commit_hash", commitHash),
+		)
+		collateralRatio := CalculateCollateralRatio(cachedPrice.BasePrice, tholdPrice)
+		s.sendQuoteResponse(w, quote, collateralRatio)
+		return
+	}
+
+	// Step 5: Fall back to CRE workflow
+	s.logger.Info("Quote not found in cache or Nostr, falling back to CRE",
+		zap.String("commit_hash", commitHash),
+	)
+	s.fallbackToCRE(w, th)
+}
+
+// sendQuoteResponse sends a QuoteResponse with the given price contract and collateral ratio
+func (s *GatewayServer) sendQuoteResponse(w http.ResponseWriter, quote *PriceContractResponse, collateralRatio float64) {
+	response := QuoteResponse{
+		PriceContractResponse: *quote,
+		CollateralRatio:       collateralRatio,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// fallbackToCRE triggers the CRE workflow and blocks waiting for response
+func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
 	// Generate domain with cryptographically random component to prevent prediction attacks
 	// An attacker who can predict domains could pre-send forged webhooks
 	randomID, err := ethsign.GenerateRequestID()
@@ -1139,7 +1309,7 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Update pending requests gauge
 	pendingRequestsGauge.Set(float64(currentPending))
 
-	s.logger.Info("CREATE request initiated",
+	s.logger.Info("CRE fallback initiated",
 		zap.String("domain", domain),
 		zap.Float64("threshold_price", th),
 		zap.String("tracking_key", trackingKey),
@@ -1179,7 +1349,7 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 				zap.Error(tholdErr),
 			)
 		}
-		s.logger.Info("CREATE request completed",
+		s.logger.Info("CRE fallback completed",
 			zap.String("domain", domain),
 			zap.String("thold_hash", tholdHash),
 			zap.String("event_id", truncateEventID(result.EventID)),
@@ -1203,8 +1373,18 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Calculate collateral ratio from the response
+		collateralRatio := CalculateCollateralRatio(uint32(priceContract.BasePrice), uint32(priceContract.TholdPrice))
+
+		// Cache the quote for future requests
+		s.quoteCache.SetQuote(priceContract.CommitHash, &priceContract)
+
+		response := QuoteResponse{
+			PriceContractResponse: priceContract,
+			CollateralRatio:       collateralRatio,
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(priceContract)
+		json.NewEncoder(w).Encode(response)
 
 	case <-time.After(s.config.BlockTimeout):
 		// Timeout - return 202 with request_id for polling
@@ -1503,6 +1683,10 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	// Mark webhook as processed AFTER all validations pass
 	s.markWebhookProcessed(payload.EventID)
+
+	// Cache price data from webhook for the new quote flow
+	// This allows handleCreate to serve quotes without calling CRE
+	s.cacheWebhookPrice(&payload)
 
 	// SECURITY: Extract domain from tags to match pending request
 	// Domain tag is REQUIRED - no fallback to event_id to prevent spoofing

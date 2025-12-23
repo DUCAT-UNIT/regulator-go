@@ -121,6 +121,36 @@ go test -v ./...
 
 ## Architecture
 
+### Quote Flow
+
+The gateway uses a tiered resolution strategy for quote requests:
+
+```
+GET /api/quote?th=95000
+         │
+         ▼
+┌─────────────────────────────────────────────────────────┐
+│                    Quote Resolution                      │
+│                                                         │
+│  1. Calculate commit_hash locally                       │
+│     commit_hash = hash340("DUCAT/commit",               │
+│       oracle_pubkey || chain_network ||                 │
+│       base_price || base_stamp || thold_price)          │
+│                                                         │
+│  2. Check local cache (5-min TTL)                       │
+│     └── If found → return with collateral_ratio         │
+│                                                         │
+│  3. Query Nostr relay by d-tag (commit_hash)            │
+│     GET /api/quotes?d=<commit_hash>                     │
+│     └── If found → cache + return with collateral_ratio │
+│                                                         │
+│  4. Fallback to CRE (trigger workflow)                  │
+│     └── Wait for webhook → return response              │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Request Flow
+
 ```
 Client Request
      │
@@ -130,27 +160,55 @@ Client Request
 └────────┬────────┘
          │
          ▼
-┌─────────────────┐
-│ Request Handler │
-└────────┬────────┘
-         │
-         ├──────────────────────┐
-         ▼                      ▼
+┌─────────────────┐         ┌─────────────────┐
+│ Request Handler │────────▶│   Quote Cache   │
+└────────┬────────┘         │  (5-min TTL)    │
+         │                  └────────┬────────┘
+         │                           │
+         │ (cache miss)              │
+         ▼                           │
+┌─────────────────┐                  │
+│  Nostr Client   │────────────────▶ │
+│  (HTTP fetch)   │ (cache on hit)   │
+└────────┬────────┘                  │
+         │                           │
+         │ (not found)               │
+         ▼                           │
+┌─────────────────┐                  │
+│ Circuit Breaker │                  │
+└────────┬────────┘                  │
+         │                           │
+         ▼                           │
 ┌─────────────────┐    ┌─────────────────┐
-│ Circuit Breaker │    │ Pending Request │
+│  CRE Gateway    │───▶│ Pending Request │
 └────────┬────────┘    │     Registry    │
          │             └────────┬────────┘
-         ▼                      │
-┌─────────────────┐             │
-│  CRE Gateway    │             │
-└────────┬────────┘             │
-         │                      │
          ▼                      │
 ┌─────────────────┐             │
 │ Webhook Handler │ ◄───────────┘
 │ (Signature      │
 │  Verification)  │
 └─────────────────┘
+```
+
+### Response Format
+
+Quote responses now include `collateral_ratio`:
+
+```json
+{
+  "chain_network": "mutinynet",
+  "oracle_pubkey": "...",
+  "base_price": 100000,
+  "base_stamp": 1703289600,
+  "commit_hash": "...",
+  "contract_id": "...",
+  "oracle_sig": "...",
+  "thold_hash": "...",
+  "thold_key": null,
+  "thold_price": 135000,
+  "collateral_ratio": 135.0
+}
 ```
 
 ## Metrics

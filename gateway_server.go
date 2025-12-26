@@ -319,8 +319,8 @@ func (s *GatewayServer) cacheWebhookPrice(payload *WebhookPayload) {
 		return
 	}
 
-	// Try to parse as PriceContractResponse
-	var priceContract PriceContractResponse
+	// Try to parse as PriceContract
+	var priceContract PriceContract
 	if err := json.Unmarshal([]byte(payload.Content), &priceContract); err != nil {
 		s.logger.Debug("Could not parse webhook content as price contract (ignoring)",
 			zap.Error(err),
@@ -331,7 +331,7 @@ func (s *GatewayServer) cacheWebhookPrice(payload *WebhookPayload) {
 	// Only cache if we have valid price data
 	if priceContract.BasePrice <= 0 || priceContract.BaseStamp <= 0 {
 		s.logger.Debug("Invalid price data in webhook (ignoring)",
-			zap.Int64("base_price", priceContract.BasePrice),
+			zap.Float64("base_price", priceContract.BasePrice),
 			zap.Int64("base_stamp", priceContract.BaseStamp),
 		)
 		return
@@ -340,7 +340,7 @@ func (s *GatewayServer) cacheWebhookPrice(payload *WebhookPayload) {
 	// Update the price cache
 	s.quoteCache.SetPrice(uint32(priceContract.BasePrice), uint32(priceContract.BaseStamp))
 	s.logger.Debug("Cached price from webhook",
-		zap.Int64("base_price", priceContract.BasePrice),
+		zap.Float64("base_price", priceContract.BasePrice),
 		zap.Int64("base_stamp", priceContract.BaseStamp),
 	)
 
@@ -665,94 +665,29 @@ type WebhookPayload struct {
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
-// PriceQuote matches cre-hmac v3 PriceEvent schema
-// NOTE: Prices are float64 to match cre-hmac which uses float64 for HMAC computation
-type PriceQuote struct {
-	// Server identity
-	SrvNetwork string `json:"srv_network"` // Network: main, test, regtest, signet, mutinynet
-	SrvPubkey  string `json:"srv_pubkey"`  // Oracle's compressed secp256k1 public key (33 bytes hex)
+// PriceContract is the v3 schema (extends PriceObservation extends PriceOracleConfig)
+// This is the only response format for the v3 branch API
+type PriceContract struct {
+	// PriceOracleConfig
+	ChainNetwork string `json:"chain_network"` // Bitcoin network
+	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
 
-	// Quote creation data
-	QuoteOrigin string  `json:"quote_origin"` // Price source: gecko, generator
-	QuotePrice  float64 `json:"quote_price"`  // BTC/USD price at quote creation
-	QuoteStamp  int64   `json:"quote_stamp"`  // Unix timestamp of quote creation
+	// PriceObservation
+	BasePrice float64 `json:"base_price"` // Quote creation price
+	BaseStamp int64   `json:"base_stamp"` // Quote creation timestamp
 
-	// Latest price data
-	LatestOrigin string  `json:"latest_origin"` // Source of latest price
-	LatestPrice  float64 `json:"latest_price"`  // Current BTC/USD price
-	LatestStamp  int64   `json:"latest_stamp"`  // Timestamp of latest price
-
-	// Event/breach data (optional, populated when threshold crossed)
-	EventOrigin *string  `json:"event_origin"` // Data source when threshold crossed (null if not breached)
-	EventPrice  *float64 `json:"event_price"`  // Price when threshold was first crossed (null if not breached)
-	EventStamp  *int64   `json:"event_stamp"`  // Timestamp when threshold crossed (null if not breached)
-	EventType   string   `json:"event_type"`   // Type: "active" or "breach"
-
-	// Threshold commitment
+	// PriceContract specific
+	CommitHash string  `json:"commit_hash"` // hash340(tag, preimage) - 32 bytes hex
+	ContractID string  `json:"contract_id"` // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig  string  `json:"oracle_sig"`  // Schnorr signature - 64 bytes hex
 	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdKey   *string `json:"thold_key"`   // Secret (null if sealed) - 32 bytes hex
 	TholdPrice float64 `json:"thold_price"` // Threshold price
-	TholdKey   *string `json:"thold_key"`   // Secret revealed on breach (null if sealed) - 32 bytes hex
-	IsExpired  bool    `json:"is_expired"`  // Whether threshold was breached
-
-	// Request identification
-	ReqID  string `json:"req_id"`  // Request ID hash - 32 bytes hex
-	ReqSig string `json:"req_sig"` // Request signature - 64 bytes hex
 }
 
-// PriceContractResponse is the internal CRE format
-// Used for backward compatibility with CRE webhook responses
-type PriceContractResponse struct {
-	ChainNetwork string  `json:"chain_network"` // Bitcoin network
-	OraclePubkey string  `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
-	BasePrice    float64 `json:"base_price"`    // Quote creation price
-	BaseStamp    int64   `json:"base_stamp"`    // Quote creation timestamp
-	CommitHash   string  `json:"commit_hash"`   // hash340(tag, preimage) - 32 bytes hex
-	ContractID   string  `json:"contract_id"`   // hash340(tag, commit||thold) - 32 bytes hex
-	OracleSig    string  `json:"oracle_sig"`    // Schnorr signature - 64 bytes hex
-	TholdHash    string  `json:"thold_hash"`    // Hash160 commitment - 20 bytes hex
-	TholdKey     *string `json:"thold_key"`     // Secret (null if sealed) - 32 bytes hex
-	TholdPrice   float64 `json:"thold_price"`   // Threshold price
-}
-
-// ToV3Quote converts internal CRE format to v3 protocol-sdk format
-func (p *PriceContractResponse) ToV3Quote() *PriceQuote {
-	isExpired := p.TholdKey != nil
-	var eventPrice *float64
-	var eventStamp *int64
-	var eventOrigin *string
-	eventType := "active"
-	if isExpired {
-		eventPrice = &p.BasePrice
-		eventStamp = &p.BaseStamp
-		origin := "cre"
-		eventOrigin = &origin
-		eventType = "breach"
-	}
-	return &PriceQuote{
-		SrvNetwork:   p.ChainNetwork,
-		SrvPubkey:    p.OraclePubkey,
-		QuoteOrigin:  "cre",
-		QuotePrice:   p.BasePrice,
-		QuoteStamp:   p.BaseStamp,
-		LatestOrigin: "cre",
-		LatestPrice:  p.BasePrice,
-		LatestStamp:  p.BaseStamp,
-		EventOrigin:  eventOrigin,
-		EventPrice:   eventPrice,
-		EventStamp:   eventStamp,
-		EventType:    eventType,
-		TholdHash:    p.TholdHash,
-		TholdPrice:   p.TholdPrice,
-		TholdKey:     p.TholdKey,
-		IsExpired:    isExpired,
-		ReqID:        p.CommitHash,
-		ReqSig:       p.OracleSig,
-	}
-}
-
-// QuoteResponse extends PriceQuote with collateral ratio for frontend
+// QuoteResponse extends PriceContract with collateral ratio for frontend
 type QuoteResponse struct {
-	PriceQuote
+	PriceContract
 	CollateralRatio float64 `json:"collateral_ratio"` // Collateral ratio as percentage (e.g., 135.0 for 135%)
 }
 
@@ -1322,11 +1257,9 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // sendQuoteResponse sends a QuoteResponse with the given price contract and collateral ratio
-func (s *GatewayServer) sendQuoteResponse(w http.ResponseWriter, quote *PriceContractResponse, collateralRatio float64) {
-	// Convert internal CRE format to v3 protocol-sdk format
-	v3Quote := quote.ToV3Quote()
+func (s *GatewayServer) sendQuoteResponse(w http.ResponseWriter, quote *PriceContract, collateralRatio float64) {
 	response := QuoteResponse{
-		PriceQuote:      *v3Quote,
+		PriceContract:   *quote,
 		CollateralRatio: collateralRatio,
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1429,7 +1362,7 @@ func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
 		s.requestsMutex.Unlock()
 
 		// Parse CRE response - already in core-ts PriceContract format
-		var priceContract PriceContractResponse
+		var priceContract PriceContract
 		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
 			s.logger.Warn("Failed to parse webhook content JSON",
 				zap.String("domain", domain),
@@ -1448,7 +1381,7 @@ func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
 		s.quoteCache.SetQuote(priceContract.CommitHash, &priceContract)
 
 		response := QuoteResponse{
-			PriceContractResponse: priceContract,
+			PriceContract: priceContract,
 			CollateralRatio:       collateralRatio,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1481,7 +1414,7 @@ func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
 
 // handleCheck handles POST /check requests by triggering a CRE "check" workflow and blocking until the corresponding webhook arrives or s.config.BlockTimeout elapses.
 // It validates the JSON body (domain and 40-char thold_hash), registers a PendingRequest keyed by domain (enforcing s.config.MaxPending), and invokes the workflow.
-// If a matching webhook is received before timeout, the pending request is marked completed and the parsed PriceContractResponse is returned (falls back to raw content on JSON parse failure).
+// If a matching webhook is received before timeout, the pending request is marked completed and the parsed PriceContract is returned (falls back to raw content on JSON parse failure).
 // If s.config.BlockTimeout elapses, the pending request is marked timed out and a 202 Accepted SyncResponse containing the request ID is returned for polling.
 func (s *GatewayServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -1585,7 +1518,7 @@ func (s *GatewayServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 		s.requestsMutex.Unlock()
 
 		// Parse CRE response - already in core-ts PriceContract format
-		var priceContract PriceContractResponse
+		var priceContract PriceContract
 		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
 			logger.Warn("Failed to parse content JSON",
 				zap.String("domain", req.Domain),
@@ -1832,7 +1765,7 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 // handleStatus responds to GET /status/{request_id} with the current state of a tracked request.
 //
 // If the request exists and its status is "completed" and the webhook payload can be unmarshaled
-// into a PriceContractResponse, the handler returns that PriceContractResponse as JSON.
+// into a PriceContract, the handler returns that PriceContract as JSON.
 // Otherwise the handler returns a SyncResponse JSON envelope containing the request's status,
 // request ID, and any captured Result; when status is "pending" the response includes a message
 // indicating processing is still underway.
@@ -1862,7 +1795,7 @@ func (s *GatewayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	// If completed, return PriceContract directly (CRE already outputs correct format)
 	if pending.Status == "completed" && pending.Result != nil {
-		var priceContract PriceContractResponse
+		var priceContract PriceContract
 		if err := json.Unmarshal([]byte(pending.Result.Content), &priceContract); err == nil {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(priceContract)
@@ -2212,16 +2145,16 @@ func getTag(tags [][]string, key string) string {
 	return ""
 }
 
-// getTholdHash extracts the TholdHash field from the WebhookPayload's Content interpreted as a PriceContractResponse.
+// getTholdHash extracts the TholdHash field from the WebhookPayload's Content interpreted as a PriceContract.
 // Returns the thold_hash and any JSON parsing error encountered.
 // Callers should handle the error case appropriately (e.g., log warning and use empty string).
 func getTholdHash(payload *WebhookPayload) (string, error) {
 	if payload == nil || payload.Content == "" {
 		return "", fmt.Errorf("payload or content is nil/empty")
 	}
-	var priceContract PriceContractResponse
+	var priceContract PriceContract
 	if err := json.Unmarshal([]byte(payload.Content), &priceContract); err != nil {
-		return "", fmt.Errorf("failed to parse content as PriceContractResponse: %w", err)
+		return "", fmt.Errorf("failed to parse content as PriceContract: %w", err)
 	}
 	return priceContract.TholdHash, nil
 }

@@ -40,7 +40,7 @@ func TestQuoteCache_SetGetQuote(t *testing.T) {
 	}
 
 	// Set quote
-	quote := &PriceContractResponse{
+	quote := &PriceContract{
 		ChainNetwork: "mutiny",
 		OraclePubkey: "deadbeef",
 		BasePrice:    100000,
@@ -59,7 +59,7 @@ func TestQuoteCache_SetGetQuote(t *testing.T) {
 		t.Errorf("Expected CommitHash %s, got %s", commitHash, retrieved.CommitHash)
 	}
 	if retrieved.TholdPrice != 95000 {
-		t.Errorf("Expected TholdPrice 95000, got %d", retrieved.TholdPrice)
+		t.Errorf("Expected TholdPrice 95000, got %f", retrieved.TholdPrice)
 	}
 }
 
@@ -70,8 +70,8 @@ func TestQuoteCache_QuoteCount(t *testing.T) {
 		t.Errorf("Expected 0 quotes initially, got %d", count)
 	}
 
-	cache.SetQuote("hash1", &PriceContractResponse{CommitHash: "hash1"})
-	cache.SetQuote("hash2", &PriceContractResponse{CommitHash: "hash2"})
+	cache.SetQuote("hash1", &PriceContract{CommitHash: "hash1"})
+	cache.SetQuote("hash2", &PriceContract{CommitHash: "hash2"})
 
 	if count := cache.QuoteCount(); count != 2 {
 		t.Errorf("Expected 2 quotes, got %d", count)
@@ -82,7 +82,7 @@ func TestQuoteCache_CleanupExpired(t *testing.T) {
 	cache := NewQuoteCache()
 	cache.quoteTTL = 1 * time.Millisecond // Very short TTL for testing
 
-	cache.SetQuote("hash1", &PriceContractResponse{CommitHash: "hash1"})
+	cache.SetQuote("hash1", &PriceContract{CommitHash: "hash1"})
 
 	// Wait for TTL to expire
 	time.Sleep(5 * time.Millisecond)
@@ -102,13 +102,13 @@ func TestQuoteCache_MaxQuotesEnforced(t *testing.T) {
 	cache.maxQuotes = 3 // Very small max for testing
 
 	// Add 4 quotes
-	cache.SetQuote("hash1", &PriceContractResponse{CommitHash: "hash1"})
+	cache.SetQuote("hash1", &PriceContract{CommitHash: "hash1"})
 	time.Sleep(1 * time.Millisecond) // Ensure different timestamps
-	cache.SetQuote("hash2", &PriceContractResponse{CommitHash: "hash2"})
+	cache.SetQuote("hash2", &PriceContract{CommitHash: "hash2"})
 	time.Sleep(1 * time.Millisecond)
-	cache.SetQuote("hash3", &PriceContractResponse{CommitHash: "hash3"})
+	cache.SetQuote("hash3", &PriceContract{CommitHash: "hash3"})
 	time.Sleep(1 * time.Millisecond)
-	cache.SetQuote("hash4", &PriceContractResponse{CommitHash: "hash4"})
+	cache.SetQuote("hash4", &PriceContract{CommitHash: "hash4"})
 
 	// Should only have 3 quotes (oldest removed)
 	if count := cache.QuoteCount(); count != 3 {

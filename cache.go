@@ -14,7 +14,7 @@ type CachedPrice struct {
 
 // CachedQuote stores a pre-baked quote from Nostr
 type CachedQuote struct {
-	Quote     *PriceContractResponse
+	Quote     *PriceContract
 	CachedAt  time.Time
 	ExpiresAt time.Time
 }
@@ -69,7 +69,7 @@ func (c *QuoteCache) GetPrice() *CachedPrice {
 }
 
 // SetQuote stores a quote by commit_hash
-func (c *QuoteCache) SetQuote(commitHash string, quote *PriceContractResponse) {
+func (c *QuoteCache) SetQuote(commitHash string, quote *PriceContract) {
 	c.quotesMu.Lock()
 	defer c.quotesMu.Unlock()
 
@@ -97,7 +97,7 @@ func (c *QuoteCache) SetQuote(commitHash string, quote *PriceContractResponse) {
 }
 
 // GetQuote retrieves a quote by commit_hash, returns nil if not found or expired
-func (c *QuoteCache) GetQuote(commitHash string) *PriceContractResponse {
+func (c *QuoteCache) GetQuote(commitHash string) *PriceContract {
 	c.quotesMu.RLock()
 	defer c.quotesMu.RUnlock()
 

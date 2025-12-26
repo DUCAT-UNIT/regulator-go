@@ -47,7 +47,7 @@ func NewNostrClient(relayURL, oraclePubkey string, logger *zap.Logger) *NostrCli
 
 // FetchQuoteByDTag fetches a quote from the Nostr relay by d-tag (commit_hash)
 // Uses NIP-33 addressable events (kind:30078)
-func (c *NostrClient) FetchQuoteByDTag(dtag string) (*PriceContractResponse, error) {
+func (c *NostrClient) FetchQuoteByDTag(dtag string) (*PriceContract, error) {
 	// Build filter for NIP-33 addressable event query
 	// Format: /nostr/addressable?pubkey=X&kind=30078&d=Y
 	reqURL := fmt.Sprintf("%s/nostr/addressable?pubkey=%s&kind=30078&d=%s",
@@ -97,8 +97,8 @@ func (c *NostrClient) FetchQuoteByDTag(dtag string) (*PriceContractResponse, err
 		event = events[0]
 	}
 
-	// Parse the content as PriceContractResponse
-	var quote PriceContractResponse
+	// Parse the content as PriceContract
+	var quote PriceContract
 	if err := json.Unmarshal([]byte(event.Content), &quote); err != nil {
 		return nil, fmt.Errorf("failed to parse quote content: %w", err)
 	}

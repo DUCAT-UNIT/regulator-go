@@ -665,8 +665,7 @@ type WebhookPayload struct {
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
-// PriceQuote matches Rust protocol-sdk v3 schema (ducat-protocol/src/oracle.rs)
-// This is the format used by validator-rs and protocol-sdk
+// PriceQuote matches cre-hmac v3 PriceEvent schema
 // NOTE: Prices are float64 to match cre-hmac which uses float64 for HMAC computation
 type PriceQuote struct {
 	// Server identity
@@ -684,20 +683,20 @@ type PriceQuote struct {
 	LatestStamp  int64   `json:"latest_stamp"`  // Timestamp of latest price
 
 	// Event/breach data (optional, populated when threshold crossed)
-	EventOrigin *string  `json:"event_origin,omitempty"` // Data source when threshold crossed
-	EventPrice  *float64 `json:"event_price,omitempty"`  // Price when threshold was first crossed
-	EventStamp  *int64   `json:"event_stamp,omitempty"`  // Timestamp when threshold crossed
-	EventType   *string  `json:"event_type,omitempty"`   // Type: none, price_drop, price_rise, breach, crash, shock
+	EventOrigin *string  `json:"event_origin"` // Data source when threshold crossed (null if not breached)
+	EventPrice  *float64 `json:"event_price"`  // Price when threshold was first crossed (null if not breached)
+	EventStamp  *int64   `json:"event_stamp"`  // Timestamp when threshold crossed (null if not breached)
+	EventType   string   `json:"event_type"`   // Type: "active" or "breach"
 
 	// Threshold commitment
-	TholdHash  string   `json:"thold_hash"`           // Hash160 commitment - 20 bytes hex
-	TholdPrice float64  `json:"thold_price"`          // Threshold price
-	TholdKey   *string  `json:"thold_key,omitempty"`  // Secret revealed on breach - 32 bytes hex
-	IsExpired  bool     `json:"is_expired"`           // Whether threshold was breached
+	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdPrice float64 `json:"thold_price"` // Threshold price
+	TholdKey   *string `json:"thold_key"`   // Secret revealed on breach (null if sealed) - 32 bytes hex
+	IsExpired  bool    `json:"is_expired"`  // Whether threshold was breached
 
 	// Request identification
-	ReqID  *string `json:"req_id,omitempty"`  // Request ID hash - 32 bytes hex
-	ReqSig *string `json:"req_sig,omitempty"` // Request signature - 64 bytes hex
+	ReqID  string `json:"req_id"`  // Request ID hash - 32 bytes hex
+	ReqSig string `json:"req_sig"` // Request signature - 64 bytes hex
 }
 
 // PriceContractResponse is the internal CRE format
@@ -720,14 +719,14 @@ func (p *PriceContractResponse) ToV3Quote() *PriceQuote {
 	isExpired := p.TholdKey != nil
 	var eventPrice *float64
 	var eventStamp *int64
-	var eventOrigin, eventType *string
+	var eventOrigin *string
+	eventType := "active"
 	if isExpired {
 		eventPrice = &p.BasePrice
 		eventStamp = &p.BaseStamp
 		origin := "cre"
 		eventOrigin = &origin
-		breach := "breach"
-		eventType = &breach
+		eventType = "breach"
 	}
 	return &PriceQuote{
 		SrvNetwork:   p.ChainNetwork,
@@ -746,8 +745,8 @@ func (p *PriceContractResponse) ToV3Quote() *PriceQuote {
 		TholdPrice:   p.TholdPrice,
 		TholdKey:     p.TholdKey,
 		IsExpired:    isExpired,
-		ReqID:        &p.CommitHash,
-		ReqSig:       &p.OracleSig,
+		ReqID:        p.CommitHash,
+		ReqSig:       p.OracleSig,
 	}
 }
 

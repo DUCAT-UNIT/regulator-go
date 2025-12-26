@@ -50,21 +50,39 @@ The Regulator is the **orchestrator** - it runs the cron jobs that drive the liq
 | `GET /readiness` | GET | Readiness probe | Kubernetes |
 | `GET /metrics` | GET | Prometheus metrics | Prometheus |
 
-### Type Schema (v2.5)
+### Type Schema (v2.5 PriceQuote)
 
 ```go
-type PriceQuoteResponse struct {
-    QuotePrice float64  `json:"quote_price"`
-    QuoteStamp int64    `json:"quote_stamp"`
-    OraclePK   string   `json:"oracle_pk"`
-    ReqID      string   `json:"req_id"`
-    ReqSig     string   `json:"req_sig"`
-    TholdHash  string   `json:"thold_hash"`
-    TholdPrice float64  `json:"thold_price"`
-    IsExpired  bool     `json:"is_expired"`
-    EvalPrice  *float64 `json:"eval_price"`
-    EvalStamp  *int64   `json:"eval_stamp"`
-    TholdKey   *string  `json:"thold_key,omitempty"`
+type PriceQuote struct {
+    // Server identity
+    SrvNetwork   string   `json:"srv_network"`   // "main" | "test"
+    SrvPubkey    string   `json:"srv_pubkey"`    // Oracle public key (hex)
+
+    // Quote price (at commitment creation)
+    QuoteOrigin  string   `json:"quote_origin"`  // "link" | "nostr" | "cre"
+    QuotePrice   float64  `json:"quote_price"`   // BTC/USD price
+    QuoteStamp   int64    `json:"quote_stamp"`   // Unix timestamp
+
+    // Latest price (most recent observation)
+    LatestOrigin string   `json:"latest_origin"`
+    LatestPrice  float64  `json:"latest_price"`
+    LatestStamp  int64    `json:"latest_stamp"`
+
+    // Event price (at breach, if any)
+    EventOrigin  *string  `json:"event_origin"`
+    EventPrice   *float64 `json:"event_price"`
+    EventStamp   *int64   `json:"event_stamp"`
+    EventType    string   `json:"event_type"`    // "active" | "breach"
+
+    // Threshold commitment
+    TholdHash    string   `json:"thold_hash"`    // Hash160 (20 bytes hex)
+    TholdKey     *string  `json:"thold_key"`     // Revealed on breach
+    TholdPrice   float64  `json:"thold_price"`
+
+    // State & signatures
+    IsExpired    bool     `json:"is_expired"`
+    ReqID        string   `json:"req_id"`        // Request ID hash
+    ReqSig       string   `json:"req_sig"`       // Schnorr signature
 }
 ```
 

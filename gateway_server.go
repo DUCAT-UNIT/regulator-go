@@ -665,28 +665,66 @@ type WebhookPayload struct {
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
-// PriceContractResponse matches core-ts PriceContract schema exactly
-// CRE publishes this format directly to Nostr - no transformation needed
-// This is what client-sdk expects from the gateway
+// PriceQuoteResponse matches client-sdk v2.5 PriceQuote schema exactly
+// This is the format client-sdk main branch expects from the gateway
+type PriceQuoteResponse struct {
+	// Base quote fields (from client-sdk v2.5)
+	QuotePrice int64  `json:"quote_price"` // BTC/USD price at quote creation
+	QuoteStamp int64  `json:"quote_stamp"` // Unix timestamp of quote creation
+	OraclePK   string `json:"oracle_pk"`   // Oracle public key (hex)
+	ReqID      string `json:"req_id"`      // Request ID hash (hex)
+	ReqSig     string `json:"req_sig"`     // Request signature (hex)
+	TholdHash  string `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdPrice int64  `json:"thold_price"` // Threshold price
+
+	// Expiration fields
+	IsExpired bool   `json:"is_expired"`           // Whether threshold was breached
+	EvalPrice *int64 `json:"eval_price"`           // Price when threshold was crossed (null if not expired)
+	EvalStamp *int64 `json:"eval_stamp"`           // Timestamp when threshold was crossed (null if not expired)
+	TholdKey  *string `json:"thold_key,omitempty"` // Secret revealed on breach (null if sealed)
+}
+
+// Legacy PriceContractResponse for internal CRE communication
+// CRE still uses this format internally
 type PriceContractResponse struct {
-	// PriceObservation fields (from core-ts)
 	ChainNetwork string `json:"chain_network"` // Bitcoin network
 	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
 	BasePrice    int64  `json:"base_price"`    // Quote creation price
 	BaseStamp    int64  `json:"base_stamp"`    // Quote creation timestamp
-
-	// PriceContract fields (from core-ts)
-	CommitHash string  `json:"commit_hash"` // hash340(tag, preimage) - 32 bytes hex
-	ContractID string  `json:"contract_id"` // hash340(tag, commit||thold) - 32 bytes hex
-	OracleSig  string  `json:"oracle_sig"`  // Schnorr signature - 64 bytes hex
-	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
-	TholdKey   *string `json:"thold_key"`   // Secret (null if sealed) - 32 bytes hex
-	TholdPrice int64   `json:"thold_price"` // Threshold price
+	CommitHash   string `json:"commit_hash"`   // hash340(tag, preimage) - 32 bytes hex
+	ContractID   string `json:"contract_id"`   // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig    string `json:"oracle_sig"`    // Schnorr signature - 64 bytes hex
+	TholdHash    string `json:"thold_hash"`    // Hash160 commitment - 20 bytes hex
+	TholdKey     *string `json:"thold_key"`    // Secret (null if sealed) - 32 bytes hex
+	TholdPrice   int64  `json:"thold_price"`   // Threshold price
 }
 
-// QuoteResponse extends PriceContractResponse with collateral ratio for frontend
+// ToV25Quote converts internal PriceContractResponse to client-sdk v2.5 format
+func (p *PriceContractResponse) ToV25Quote() *PriceQuoteResponse {
+	isExpired := p.TholdKey != nil
+	var evalPrice, evalStamp *int64
+	if isExpired {
+		evalPrice = &p.BasePrice
+		evalStamp = &p.BaseStamp
+	}
+	return &PriceQuoteResponse{
+		QuotePrice: p.BasePrice,
+		QuoteStamp: p.BaseStamp,
+		OraclePK:   p.OraclePubkey,
+		ReqID:      p.CommitHash,  // Using commit_hash as req_id
+		ReqSig:     p.OracleSig,
+		TholdHash:  p.TholdHash,
+		TholdPrice: p.TholdPrice,
+		IsExpired:  isExpired,
+		EvalPrice:  evalPrice,
+		EvalStamp:  evalStamp,
+		TholdKey:   p.TholdKey,
+	}
+}
+
+// QuoteResponse is the v2.5 format returned to clients via /api/quote
 type QuoteResponse struct {
-	PriceContractResponse
+	PriceQuoteResponse
 	CollateralRatio float64 `json:"collateral_ratio"` // Collateral ratio as percentage (e.g., 135.0 for 135%)
 }
 
@@ -1255,11 +1293,13 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	s.fallbackToCRE(w, th)
 }
 
-// sendQuoteResponse sends a QuoteResponse with the given price contract and collateral ratio
+// sendQuoteResponse sends a QuoteResponse in v2.5 format with the given price contract and collateral ratio
 func (s *GatewayServer) sendQuoteResponse(w http.ResponseWriter, quote *PriceContractResponse, collateralRatio float64) {
+	// Convert internal format to v2.5 client-sdk format
+	v25Quote := quote.ToV25Quote()
 	response := QuoteResponse{
-		PriceContractResponse: *quote,
-		CollateralRatio:       collateralRatio,
+		PriceQuoteResponse: *v25Quote,
+		CollateralRatio:    collateralRatio,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
@@ -1379,12 +1419,8 @@ func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
 		// Cache the quote for future requests
 		s.quoteCache.SetQuote(priceContract.CommitHash, &priceContract)
 
-		response := QuoteResponse{
-			PriceContractResponse: priceContract,
-			CollateralRatio:       collateralRatio,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		// Convert to v2.5 format for client-sdk
+		s.sendQuoteResponse(w, &priceContract, collateralRatio)
 
 	case <-time.After(s.config.BlockTimeout):
 		// Timeout - return 202 with request_id for polling

@@ -667,42 +667,44 @@ type WebhookPayload struct {
 
 // PriceQuoteResponse matches client-sdk v2.5 PriceQuote schema exactly
 // This is the format client-sdk main branch expects from the gateway
+// NOTE: Prices are float64 to match cre-hmac which uses float64 for HMAC computation
 type PriceQuoteResponse struct {
 	// Base quote fields (from client-sdk v2.5)
-	QuotePrice int64  `json:"quote_price"` // BTC/USD price at quote creation
-	QuoteStamp int64  `json:"quote_stamp"` // Unix timestamp of quote creation
-	OraclePK   string `json:"oracle_pk"`   // Oracle public key (hex)
-	ReqID      string `json:"req_id"`      // Request ID hash (hex)
-	ReqSig     string `json:"req_sig"`     // Request signature (hex)
-	TholdHash  string `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
-	TholdPrice int64  `json:"thold_price"` // Threshold price
+	QuotePrice float64 `json:"quote_price"` // BTC/USD price at quote creation
+	QuoteStamp int64   `json:"quote_stamp"` // Unix timestamp of quote creation
+	OraclePK   string  `json:"oracle_pk"`   // Oracle public key (hex)
+	ReqID      string  `json:"req_id"`      // Request ID hash (hex)
+	ReqSig     string  `json:"req_sig"`     // Request signature (hex)
+	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdPrice float64 `json:"thold_price"` // Threshold price
 
 	// Expiration fields
-	IsExpired bool   `json:"is_expired"`           // Whether threshold was breached
-	EvalPrice *int64 `json:"eval_price"`           // Price when threshold was crossed (null if not expired)
-	EvalStamp *int64 `json:"eval_stamp"`           // Timestamp when threshold was crossed (null if not expired)
-	TholdKey  *string `json:"thold_key,omitempty"` // Secret revealed on breach (null if sealed)
+	IsExpired bool     `json:"is_expired"`           // Whether threshold was breached
+	EvalPrice *float64 `json:"eval_price"`           // Price when threshold was crossed (null if not expired)
+	EvalStamp *int64   `json:"eval_stamp"`           // Timestamp when threshold was crossed (null if not expired)
+	TholdKey  *string  `json:"thold_key,omitempty"`  // Secret revealed on breach (null if sealed)
 }
 
 // Legacy PriceContractResponse for internal CRE communication
 // CRE still uses this format internally
 type PriceContractResponse struct {
-	ChainNetwork string `json:"chain_network"` // Bitcoin network
-	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
-	BasePrice    int64  `json:"base_price"`    // Quote creation price
-	BaseStamp    int64  `json:"base_stamp"`    // Quote creation timestamp
-	CommitHash   string `json:"commit_hash"`   // hash340(tag, preimage) - 32 bytes hex
-	ContractID   string `json:"contract_id"`   // hash340(tag, commit||thold) - 32 bytes hex
-	OracleSig    string `json:"oracle_sig"`    // Schnorr signature - 64 bytes hex
-	TholdHash    string `json:"thold_hash"`    // Hash160 commitment - 20 bytes hex
-	TholdKey     *string `json:"thold_key"`    // Secret (null if sealed) - 32 bytes hex
-	TholdPrice   int64  `json:"thold_price"`   // Threshold price
+	ChainNetwork string  `json:"chain_network"` // Bitcoin network
+	OraclePubkey string  `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
+	BasePrice    float64 `json:"base_price"`    // Quote creation price
+	BaseStamp    int64   `json:"base_stamp"`    // Quote creation timestamp
+	CommitHash   string  `json:"commit_hash"`   // hash340(tag, preimage) - 32 bytes hex
+	ContractID   string  `json:"contract_id"`   // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig    string  `json:"oracle_sig"`    // Schnorr signature - 64 bytes hex
+	TholdHash    string  `json:"thold_hash"`    // Hash160 commitment - 20 bytes hex
+	TholdKey     *string `json:"thold_key"`     // Secret (null if sealed) - 32 bytes hex
+	TholdPrice   float64 `json:"thold_price"`   // Threshold price
 }
 
 // ToV25Quote converts internal PriceContractResponse to client-sdk v2.5 format
 func (p *PriceContractResponse) ToV25Quote() *PriceQuoteResponse {
 	isExpired := p.TholdKey != nil
-	var evalPrice, evalStamp *int64
+	var evalPrice *float64
+	var evalStamp *int64
 	if isExpired {
 		evalPrice = &p.BasePrice
 		evalStamp = &p.BaseStamp
@@ -711,7 +713,7 @@ func (p *PriceContractResponse) ToV25Quote() *PriceQuoteResponse {
 		QuotePrice: p.BasePrice,
 		QuoteStamp: p.BaseStamp,
 		OraclePK:   p.OraclePubkey,
-		ReqID:      p.CommitHash,  // Using commit_hash as req_id
+		ReqID:      p.CommitHash, // Using commit_hash as req_id
 		ReqSig:     p.OracleSig,
 		TholdHash:  p.TholdHash,
 		TholdPrice: p.TholdPrice,

@@ -59,7 +59,7 @@ func TestQuoteCache_SetGetQuote(t *testing.T) {
 		t.Errorf("Expected CommitHash %s, got %s", commitHash, retrieved.CommitHash)
 	}
 	if retrieved.TholdPrice != 95000 {
-		t.Errorf("Expected TholdPrice 95000, got %d", retrieved.TholdPrice)
+		t.Errorf("Expected TholdPrice 95000, got %f", retrieved.TholdPrice)
 	}
 }
 

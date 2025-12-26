@@ -669,20 +669,35 @@ type WebhookPayload struct {
 // This is the format client-sdk main branch expects from the gateway
 // NOTE: Prices are float64 to match cre-hmac which uses float64 for HMAC computation
 type PriceQuoteResponse struct {
-	// Base quote fields (from client-sdk v2.5)
-	QuotePrice float64 `json:"quote_price"` // BTC/USD price at quote creation
-	QuoteStamp int64   `json:"quote_stamp"` // Unix timestamp of quote creation
-	OraclePK   string  `json:"oracle_pk"`   // Oracle public key (hex)
-	ReqID      string  `json:"req_id"`      // Request ID hash (hex)
-	ReqSig     string  `json:"req_sig"`     // Request signature (hex)
-	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
-	TholdPrice float64 `json:"thold_price"` // Threshold price
+	// Server identity
+	SrvNetwork string `json:"srv_network"` // "main" | "test"
+	SrvPubkey  string `json:"srv_pubkey"`  // Oracle public key (hex)
 
-	// Expiration fields
-	IsExpired bool     `json:"is_expired"`           // Whether threshold was breached
-	EvalPrice *float64 `json:"eval_price"`           // Price when threshold was crossed (null if not expired)
-	EvalStamp *int64   `json:"eval_stamp"`           // Timestamp when threshold was crossed (null if not expired)
-	TholdKey  *string  `json:"thold_key,omitempty"`  // Secret revealed on breach (null if sealed)
+	// Quote price (at commitment creation)
+	QuoteOrigin string  `json:"quote_origin"` // "link" | "nostr" | "cre"
+	QuotePrice  float64 `json:"quote_price"`  // BTC/USD price
+	QuoteStamp  int64   `json:"quote_stamp"`  // Unix timestamp
+
+	// Latest price (most recent observation)
+	LatestOrigin string  `json:"latest_origin"`
+	LatestPrice  float64 `json:"latest_price"`
+	LatestStamp  int64   `json:"latest_stamp"`
+
+	// Event price (at breach, if any)
+	EventOrigin *string  `json:"event_origin"`
+	EventPrice  *float64 `json:"event_price"`
+	EventStamp  *int64   `json:"event_stamp"`
+	EventType   string   `json:"event_type"` // "active" | "breach"
+
+	// Threshold commitment
+	TholdHash  string  `json:"thold_hash"`
+	TholdKey   *string `json:"thold_key,omitempty"`
+	TholdPrice float64 `json:"thold_price"`
+
+	// State & signatures
+	IsExpired bool   `json:"is_expired"`
+	ReqID     string `json:"req_id"`
+	ReqSig    string `json:"req_sig"`
 }
 
 // Legacy PriceContractResponse for internal CRE communication
@@ -703,24 +718,42 @@ type PriceContractResponse struct {
 // ToV25Quote converts internal PriceContractResponse to client-sdk v2.5 format
 func (p *PriceContractResponse) ToV25Quote() *PriceQuoteResponse {
 	isExpired := p.TholdKey != nil
-	var evalPrice *float64
-	var evalStamp *int64
+	origin := "cre"
+	var eventOrigin *string
+	var eventPrice *float64
+	var eventStamp *int64
+	eventType := "active"
 	if isExpired {
-		evalPrice = &p.BasePrice
-		evalStamp = &p.BaseStamp
+		eventOrigin = &origin
+		eventPrice = &p.BasePrice
+		eventStamp = &p.BaseStamp
+		eventType = "breach"
 	}
 	return &PriceQuoteResponse{
-		QuotePrice: p.BasePrice,
-		QuoteStamp: p.BaseStamp,
-		OraclePK:   p.OraclePubkey,
-		ReqID:      p.CommitHash, // Using commit_hash as req_id
-		ReqSig:     p.OracleSig,
+		// Server identity
+		SrvNetwork: p.ChainNetwork,
+		SrvPubkey:  p.OraclePubkey,
+		// Quote price
+		QuoteOrigin: origin,
+		QuotePrice:  p.BasePrice,
+		QuoteStamp:  p.BaseStamp,
+		// Latest price (same as quote for CRE responses)
+		LatestOrigin: origin,
+		LatestPrice:  p.BasePrice,
+		LatestStamp:  p.BaseStamp,
+		// Event price
+		EventOrigin: eventOrigin,
+		EventPrice:  eventPrice,
+		EventStamp:  eventStamp,
+		EventType:   eventType,
+		// Threshold commitment
 		TholdHash:  p.TholdHash,
-		TholdPrice: p.TholdPrice,
-		IsExpired:  isExpired,
-		EvalPrice:  evalPrice,
-		EvalStamp:  evalStamp,
 		TholdKey:   p.TholdKey,
+		TholdPrice: p.TholdPrice,
+		// State & signatures
+		IsExpired: isExpired,
+		ReqID:     p.CommitHash, // Using commit_hash as req_id
+		ReqSig:    p.OracleSig,
 	}
 }
 

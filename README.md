@@ -49,21 +49,25 @@ The Regulator is the **orchestrator** - it runs the cron jobs that drive the liq
 | `GET /readiness` | GET | Readiness probe | Kubernetes |
 | `GET /metrics` | GET | Prometheus metrics | Prometheus |
 
-### Type Schema (v2.5)
+### Type Schema (v3 PriceContract)
 
 ```go
-type PriceQuoteResponse struct {
-    QuotePrice float64  `json:"quote_price"`
-    QuoteStamp int64    `json:"quote_stamp"`
-    OraclePK   string   `json:"oracle_pk"`
-    ReqID      string   `json:"req_id"`
-    ReqSig     string   `json:"req_sig"`
-    TholdHash  string   `json:"thold_hash"`
-    TholdPrice float64  `json:"thold_price"`
-    IsExpired  bool     `json:"is_expired"`
-    EvalPrice  *float64 `json:"eval_price"`
-    EvalStamp  *int64   `json:"eval_stamp"`
-    TholdKey   *string  `json:"thold_key,omitempty"`
+type PriceContract struct {
+    ChainNetwork string  `json:"chain_network"` // "mutinynet" | "mainnet"
+    OraclePubkey string  `json:"oracle_pubkey"` // Oracle public key (hex)
+    BasePrice    float64 `json:"base_price"`    // BTC/USD at commitment
+    BaseStamp    int64   `json:"base_stamp"`    // Unix timestamp
+    CommitHash   string  `json:"commit_hash"`   // BIP-340 tagged hash
+    ContractID   string  `json:"contract_id"`   // Unique contract ID
+    OracleSig    string  `json:"oracle_sig"`    // Schnorr signature
+    TholdHash    string  `json:"thold_hash"`    // Hash160 commitment
+    TholdKey     *string `json:"thold_key"`     // Revealed on breach
+    TholdPrice   float64 `json:"thold_price"`   // Threshold price
+}
+
+type QuoteResponse struct {
+    PriceContract                            // Embedded contract fields
+    CollateralRatio float64 `json:"collateral_ratio"` // (thold_price / base_price) * 100
 }
 ```
 

@@ -42,6 +42,7 @@ The Regulator is the **orchestrator** - it runs the cron jobs that drive the liq
 | Endpoint | Method | Purpose | Called By |
 |----------|--------|---------|-----------|
 | `GET /api/quote?th=PRICE` | GET | Create threshold commitment | Client SDK |
+| `GET /api/price` | GET | Get latest cached price | Client SDK |
 | `POST /webhook/ducat` | POST | Receive CRE callback | CRE |
 | `POST /check` | POST | Check if threshold breached | Internal (liquidation) |
 | `GET /status/:id` | GET | Poll async request status | Client SDK |
@@ -125,6 +126,25 @@ Create a threshold price commitment.
   "thold_hash": "...",
   "thold_key": null,
   "thold_price": 49000
+}
+```
+
+### `GET /api/price`
+Get the latest cached BTC/USD price.
+
+**Response** (200 OK):
+```json
+{
+  "USD": 87202,
+  "time": 1766771403
+}
+```
+
+**Response** (503 Service Unavailable):
+```json
+{
+  "error": "no price available",
+  "message": "price data is stale or not yet received"
 }
 ```
 

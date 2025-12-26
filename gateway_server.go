@@ -331,7 +331,7 @@ func (s *GatewayServer) cacheWebhookPrice(payload *WebhookPayload) {
 	// Only cache if we have valid price data
 	if priceContract.BasePrice <= 0 || priceContract.BaseStamp <= 0 {
 		s.logger.Debug("Invalid price data in webhook (ignoring)",
-			zap.Int64("base_price", priceContract.BasePrice),
+			zap.Float64("base_price", priceContract.BasePrice),
 			zap.Int64("base_stamp", priceContract.BaseStamp),
 		)
 		return
@@ -340,7 +340,7 @@ func (s *GatewayServer) cacheWebhookPrice(payload *WebhookPayload) {
 	// Update the price cache
 	s.quoteCache.SetPrice(uint32(priceContract.BasePrice), uint32(priceContract.BaseStamp))
 	s.logger.Debug("Cached price from webhook",
-		zap.Int64("base_price", priceContract.BasePrice),
+		zap.Float64("base_price", priceContract.BasePrice),
 		zap.Int64("base_stamp", priceContract.BaseStamp),
 	)
 
@@ -1012,6 +1012,8 @@ func main() {
 	// Rate limiting applied to both /api/quote and /webhook/ducat to prevent DoS
 	http.Handle("/api/quote", panicRecoveryMiddleware(
 		metricsMiddleware("create", server.rateLimitMiddleware(http.HandlerFunc(server.handleCreate)))))
+	http.Handle("/api/price", panicRecoveryMiddleware(
+		metricsMiddleware("price", http.HandlerFunc(server.handlePrice))))
 	http.Handle("/webhook/ducat", panicRecoveryMiddleware(
 		metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook)))))
 	http.Handle("/health", panicRecoveryMiddleware(http.HandlerFunc(handleHealth)))
@@ -1033,6 +1035,7 @@ func main() {
 	logger.Info("Endpoints registered",
 		zap.Strings("endpoints", []string{
 			"GET /api/quote?th=PRICE - Create threshold commitment",
+			"GET /api/price - Get latest cached price",
 			"POST /webhook/ducat - CRE callback endpoint",
 			"GET /health - Liveness probe (simple health check)",
 			"GET /readiness - Readiness probe (dependency checks)",
@@ -1896,6 +1899,29 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	healthChecks.WithLabelValues("liveness", "healthy").Inc()
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// GET /api/price - Return the latest cached price from oracle
+func (s *GatewayServer) handlePrice(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	cached := s.quoteCache.GetPrice()
+	if cached == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":   "no price available",
+			"message": "price data is stale or not yet received",
+		})
+		return
+	}
+
+	response := map[string]interface{}{
+		"USD":  float64(cached.BasePrice),
+		"time": cached.BaseStamp,
+	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)

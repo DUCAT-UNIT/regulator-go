@@ -9,6 +9,66 @@ The gateway server handles:
 - **Webhook Processing**: Receives signed responses from CRE
 - **Liquidation Monitoring**: Polls at-risk vaults and triggers breach checks
 
+## System Integration
+
+The Regulator is the **orchestrator** - it runs the cron jobs that drive the liquidation system.
+
+### Role in System
+
+```
+┌─────────────┐                      ┌─────────────┐
+│   Client    │ ◄──────────────────► │  Regulator  │
+│   (SDK)     │    REST API          │  (Gateway)  │
+└─────────────┘                      └──────┬──────┘
+                                            │
+                    ┌───────────────────────┼───────────────────────┐
+                    │                       │                       │
+                    ▼                       ▼                       ▼
+            ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
+            │     CRE     │         │ Nostr Relay │         │   Indexer   │
+            │   (WASM)    │         │             │         │ (at-risk)   │
+            └─────────────┘         └─────────────┘         └─────────────┘
+```
+
+### Background Jobs
+
+| Job | Frequency | Action |
+|-----|-----------|--------|
+| **Liquidation Poller** | Every 90s | Poll indexer `/at-risk`, trigger CRE CHECK for each |
+| **Cleanup Job** | Every 2min | Remove stale pending requests |
+
+### Endpoints
+
+| Endpoint | Method | Purpose | Called By |
+|----------|--------|---------|-----------|
+| `GET /api/quote?th=PRICE` | GET | Create threshold commitment | Client SDK |
+| `POST /webhook/ducat` | POST | Receive CRE callback | CRE |
+| `POST /check` | POST | Check if threshold breached | Internal (liquidation) |
+| `GET /status/:id` | GET | Poll async request status | Client SDK |
+| `GET /health` | GET | Liveness probe | Kubernetes |
+| `GET /readiness` | GET | Readiness probe | Kubernetes |
+| `GET /metrics` | GET | Prometheus metrics | Prometheus |
+
+### Type Schema (v2.5)
+
+```go
+type PriceQuoteResponse struct {
+    QuotePrice float64  `json:"quote_price"`
+    QuoteStamp int64    `json:"quote_stamp"`
+    OraclePK   string   `json:"oracle_pk"`
+    ReqID      string   `json:"req_id"`
+    ReqSig     string   `json:"req_sig"`
+    TholdHash  string   `json:"thold_hash"`
+    TholdPrice float64  `json:"thold_price"`
+    IsExpired  bool     `json:"is_expired"`
+    EvalPrice  *float64 `json:"eval_price"`
+    EvalStamp  *int64   `json:"eval_stamp"`
+    TholdKey   *string  `json:"thold_key,omitempty"`
+}
+```
+
+**Note**: All prices are `float64` to match cre-hmac HMAC computation.
+
 ## Security Features
 
 - **BIP-340 Schnorr Signature Verification**: All webhooks verified against expected CRE public key

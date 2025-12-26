@@ -667,32 +667,33 @@ type WebhookPayload struct {
 
 // PriceQuote matches Rust protocol-sdk v3 schema (ducat-protocol/src/oracle.rs)
 // This is the format used by validator-rs and protocol-sdk
+// NOTE: Prices are float64 to match cre-hmac which uses float64 for HMAC computation
 type PriceQuote struct {
 	// Server identity
 	SrvNetwork string `json:"srv_network"` // Network: main, test, regtest, signet, mutinynet
 	SrvPubkey  string `json:"srv_pubkey"`  // Oracle's compressed secp256k1 public key (33 bytes hex)
 
 	// Quote creation data
-	QuoteOrigin string `json:"quote_origin"` // Price source: gecko, generator
-	QuotePrice  int64  `json:"quote_price"`  // BTC/USD price at quote creation
-	QuoteStamp  int64  `json:"quote_stamp"`  // Unix timestamp of quote creation
+	QuoteOrigin string  `json:"quote_origin"` // Price source: gecko, generator
+	QuotePrice  float64 `json:"quote_price"`  // BTC/USD price at quote creation
+	QuoteStamp  int64   `json:"quote_stamp"`  // Unix timestamp of quote creation
 
 	// Latest price data
-	LatestOrigin string `json:"latest_origin"` // Source of latest price
-	LatestPrice  int64  `json:"latest_price"`  // Current BTC/USD price
-	LatestStamp  int64  `json:"latest_stamp"`  // Timestamp of latest price
+	LatestOrigin string  `json:"latest_origin"` // Source of latest price
+	LatestPrice  float64 `json:"latest_price"`  // Current BTC/USD price
+	LatestStamp  int64   `json:"latest_stamp"`  // Timestamp of latest price
 
 	// Event/breach data (optional, populated when threshold crossed)
-	EventOrigin *string `json:"event_origin,omitempty"` // Data source when threshold crossed
-	EventPrice  *int64  `json:"event_price,omitempty"`  // Price when threshold was first crossed
-	EventStamp  *int64  `json:"event_stamp,omitempty"`  // Timestamp when threshold crossed
-	EventType   *string `json:"event_type,omitempty"`   // Type: none, price_drop, price_rise, breach, crash, shock
+	EventOrigin *string  `json:"event_origin,omitempty"` // Data source when threshold crossed
+	EventPrice  *float64 `json:"event_price,omitempty"`  // Price when threshold was first crossed
+	EventStamp  *int64   `json:"event_stamp,omitempty"`  // Timestamp when threshold crossed
+	EventType   *string  `json:"event_type,omitempty"`   // Type: none, price_drop, price_rise, breach, crash, shock
 
 	// Threshold commitment
-	TholdHash  string  `json:"thold_hash"`            // Hash160 commitment - 20 bytes hex
-	TholdPrice int64   `json:"thold_price"`           // Threshold price
-	TholdKey   *string `json:"thold_key,omitempty"`   // Secret revealed on breach - 32 bytes hex
-	IsExpired  bool    `json:"is_expired"`            // Whether threshold was breached
+	TholdHash  string   `json:"thold_hash"`           // Hash160 commitment - 20 bytes hex
+	TholdPrice float64  `json:"thold_price"`          // Threshold price
+	TholdKey   *string  `json:"thold_key,omitempty"`  // Secret revealed on breach - 32 bytes hex
+	IsExpired  bool     `json:"is_expired"`           // Whether threshold was breached
 
 	// Request identification
 	ReqID  *string `json:"req_id,omitempty"`  // Request ID hash - 32 bytes hex
@@ -702,22 +703,23 @@ type PriceQuote struct {
 // PriceContractResponse is the internal CRE format
 // Used for backward compatibility with CRE webhook responses
 type PriceContractResponse struct {
-	ChainNetwork string `json:"chain_network"` // Bitcoin network
-	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
-	BasePrice    int64  `json:"base_price"`    // Quote creation price
-	BaseStamp    int64  `json:"base_stamp"`    // Quote creation timestamp
-	CommitHash   string `json:"commit_hash"`   // hash340(tag, preimage) - 32 bytes hex
-	ContractID   string `json:"contract_id"`   // hash340(tag, commit||thold) - 32 bytes hex
-	OracleSig    string `json:"oracle_sig"`    // Schnorr signature - 64 bytes hex
-	TholdHash    string `json:"thold_hash"`    // Hash160 commitment - 20 bytes hex
-	TholdKey     *string `json:"thold_key"`    // Secret (null if sealed) - 32 bytes hex
-	TholdPrice   int64  `json:"thold_price"`   // Threshold price
+	ChainNetwork string  `json:"chain_network"` // Bitcoin network
+	OraclePubkey string  `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
+	BasePrice    float64 `json:"base_price"`    // Quote creation price
+	BaseStamp    int64   `json:"base_stamp"`    // Quote creation timestamp
+	CommitHash   string  `json:"commit_hash"`   // hash340(tag, preimage) - 32 bytes hex
+	ContractID   string  `json:"contract_id"`   // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig    string  `json:"oracle_sig"`    // Schnorr signature - 64 bytes hex
+	TholdHash    string  `json:"thold_hash"`    // Hash160 commitment - 20 bytes hex
+	TholdKey     *string `json:"thold_key"`     // Secret (null if sealed) - 32 bytes hex
+	TholdPrice   float64 `json:"thold_price"`   // Threshold price
 }
 
 // ToV3Quote converts internal CRE format to v3 protocol-sdk format
 func (p *PriceContractResponse) ToV3Quote() *PriceQuote {
 	isExpired := p.TholdKey != nil
-	var eventPrice, eventStamp *int64
+	var eventPrice *float64
+	var eventStamp *int64
 	var eventOrigin, eventType *string
 	if isExpired {
 		eventPrice = &p.BasePrice

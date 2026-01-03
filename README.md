@@ -98,6 +98,26 @@ type PriceQuote struct {
 - **Circuit Breaker**: Prevents cascading failures to CRE gateway
 - **Request Body Limits**: Prevents memory exhaustion attacks
 
+## CRE Integration
+
+### Request Size Limits
+
+CRE has a **30KB maximum request size** (including headers and body). The gateway automatically batches large liquidation requests:
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Batch Size | 500 vaults | ~22KB per batch (safely under 30KB) |
+| Batch Delay | 10 seconds | Avoid CRE rate limits (429 errors) |
+
+### Batch Processing
+
+When the liquidation poller detects at-risk vaults:
+
+1. Vaults are split into batches of 500
+2. Each batch triggers a separate CRE `evaluate` workflow
+3. 10-second delay between batches prevents rate limiting
+4. Success/failure logged per batch with running totals
+
 ## Environment Variables
 
 ### Required

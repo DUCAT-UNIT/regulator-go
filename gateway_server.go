@@ -2495,9 +2495,12 @@ func (s *GatewayServer) doLiquidationPoll() {
 	}
 }
 
-// triggerBatchEvaluate triggers the CRE "evaluate" workflow with a batch of thold_hashes.
+// triggerCheckForAtRiskVaults triggers the CRE "evaluate" workflow with all thold_hashes in a single request.
 // This will cause the oracle to check if any prices have breached their thresholds and reveal
 // the thold_key if so. The breach events are published to Nostr and picked up by the liquidation service.
+//
+// Note: CRE has request body size limits (estimated ~30-100KB based on Chainlink Functions limits).
+// We batch vaults into groups of 2000 to stay safely under the limit (~90KB per batch).
 func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 	if len(vaults) == 0 {
 		return
@@ -2523,28 +2526,68 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 		return
 	}
 
-	s.logger.Info("Triggering batch CRE evaluate for at-risk vaults",
-		zap.Int("count", len(tholdHashes)),
+	// CRE has a 30KB maximum request size limit (including headers and body).
+	// Each thold_hash is ~45 bytes (40 hex chars + JSON overhead).
+	// With JSON-RPC wrapper overhead (~500 bytes), we can fit ~650 vaults max.
+	// Using 500 per batch for safety margin.
+	const batchSize = 500
+
+	totalVaults := len(tholdHashes)
+	numBatches := (totalVaults + batchSize - 1) / batchSize
+
+	s.logger.Info("Triggering CRE evaluate for at-risk vaults",
+		zap.Int("total_vaults", totalVaults),
+		zap.Int("batch_size", batchSize),
+		zap.Int("num_batches", numBatches),
 	)
 
-	// Generate a unique domain for this batch evaluation
-	domain := fmt.Sprintf("liq-batch-%d", time.Now().UnixNano())
+	successCount := 0
+	errorCount := 0
 
-	// Trigger the batch evaluate workflow
-	err := s.triggerEvaluateWorkflow(domain, tholdHashes, s.config.CallbackURL)
-	if err != nil {
-		s.logger.Error("Failed to trigger batch evaluate workflow",
-			zap.Int("batch_size", len(tholdHashes)),
-			zap.Error(err),
-		)
-		liquidationCheckTriggers.WithLabelValues("error").Inc()
-	} else {
-		liquidationCheckTriggers.WithLabelValues("success").Inc()
-		s.logger.Info("Triggered batch evaluate workflow",
-			zap.Int("batch_size", len(tholdHashes)),
-			zap.String("domain", domain),
-		)
+	for i := 0; i < totalVaults; i += batchSize {
+		end := i + batchSize
+		if end > totalVaults {
+			end = totalVaults
+		}
+		batch := tholdHashes[i:end]
+		batchNum := (i / batchSize) + 1
+
+		// Generate a unique domain for this batch
+		domain := fmt.Sprintf("liq-%d-b%d", time.Now().UnixNano(), batchNum)
+
+		err := s.triggerEvaluateWorkflow(domain, batch, s.config.CallbackURL)
+		if err != nil {
+			s.logger.Error("Failed to trigger evaluate workflow batch",
+				zap.Int("batch", batchNum),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("total_batches", numBatches),
+				zap.Error(err),
+			)
+			errorCount++
+			liquidationCheckTriggers.WithLabelValues("error").Inc()
+		} else {
+			s.logger.Info("Triggered evaluate workflow batch",
+				zap.Int("batch", batchNum),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("total_batches", numBatches),
+				zap.String("domain", domain),
+			)
+			successCount++
+			liquidationCheckTriggers.WithLabelValues("success").Inc()
+		}
+
+		// Delay between batches to avoid CRE rate limits (429 errors observed at 500ms)
+		// CRE appears to allow ~6 requests before rate limiting, then needs cooldown
+		if end < totalVaults {
+			time.Sleep(10 * time.Second)
+		}
 	}
+
+	s.logger.Info("Completed triggering evaluate workflow batches",
+		zap.Int("successful_batches", successCount),
+		zap.Int("failed_batches", errorCount),
+		zap.Int("total_vaults", totalVaults),
+	)
 }
 
 // triggerEvaluateWorkflow sends HTTP trigger to CRE gateway for batch quote evaluation
@@ -2559,7 +2602,9 @@ func (s *GatewayServer) triggerEvaluateWorkflow(domain string, tholdHashes []str
 	}
 
 	// Build input for evaluate workflow
+	// IMPORTANT: The "action" field must be "evaluate" for the CRE WASM workflow to route correctly
 	input := map[string]interface{}{
+		"action":       "evaluate",
 		"domain":       domain,
 		"thold_hashes": tholdHashes,
 		"callback_url": callbackURL,

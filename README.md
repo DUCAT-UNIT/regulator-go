@@ -251,7 +251,7 @@ GET /api/quote?th=95000
 │                    Quote Resolution                      │
 │                                                         │
 │  1. Calculate commit_hash locally                       │
-│     commit_hash = hash340("DUCAT/commit",               │
+│     commit_hash = hash340("ducat/price_commit_hash",    │
 │       oracle_pubkey || chain_network ||                 │
 │       base_price || base_stamp || thold_price)          │
 │                                                         │

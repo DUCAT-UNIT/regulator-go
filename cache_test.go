@@ -78,22 +78,33 @@ func TestQuoteCache_QuoteCount(t *testing.T) {
 	}
 }
 
-func TestQuoteCache_CleanupExpired(t *testing.T) {
+func TestQuoteCache_PriceChangeInvalidatesQuotes(t *testing.T) {
 	cache := NewQuoteCache()
-	cache.quoteTTL = 1 * time.Millisecond // Very short TTL for testing
 
+	// Set initial price and add quotes
+	cache.SetPrice(100000, 1700000000)
 	cache.SetQuote("hash1", &PriceContractResponse{CommitHash: "hash1"})
+	cache.SetQuote("hash2", &PriceContractResponse{CommitHash: "hash2"})
 
-	// Wait for TTL to expire
-	time.Sleep(5 * time.Millisecond)
-
-	cleaned := cache.CleanupExpired()
-	if cleaned != 1 {
-		t.Errorf("Expected 1 cleaned, got %d", cleaned)
+	if count := cache.QuoteCount(); count != 2 {
+		t.Errorf("Expected 2 quotes, got %d", count)
 	}
 
+	// Same price should not invalidate
+	cache.SetPrice(100000, 1700000000)
+	if count := cache.QuoteCount(); count != 2 {
+		t.Errorf("Expected 2 quotes after same price, got %d", count)
+	}
+
+	// Different price should invalidate all quotes
+	cache.SetPrice(100001, 1700000001)
 	if count := cache.QuoteCount(); count != 0 {
-		t.Errorf("Expected 0 quotes after cleanup, got %d", count)
+		t.Errorf("Expected 0 quotes after price change, got %d", count)
+	}
+
+	// Quotes should be gone
+	if quote := cache.GetQuote("hash1"); quote != nil {
+		t.Error("Expected hash1 to be invalidated")
 	}
 }
 

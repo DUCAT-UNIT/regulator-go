@@ -14,19 +14,18 @@ type CachedPrice struct {
 
 // CachedQuote stores a pre-baked quote from Nostr
 type CachedQuote struct {
-	Quote     *PriceContractResponse
-	CachedAt  time.Time
-	ExpiresAt time.Time
+	Quote    *PriceContractResponse
+	CachedAt time.Time
 }
 
 // QuoteCache provides thread-safe caching for price data and pre-baked quotes
+// Quotes are invalidated when the price changes, not by TTL
 type QuoteCache struct {
 	priceMu   sync.RWMutex
 	price     *CachedPrice
 	quotesMu  sync.RWMutex
 	quotes    map[string]*CachedQuote
 	maxQuotes int
-	quoteTTL  time.Duration
 }
 
 // NewQuoteCache creates a new quote cache with default settings
@@ -34,18 +33,26 @@ func NewQuoteCache() *QuoteCache {
 	return &QuoteCache{
 		quotes:    make(map[string]*CachedQuote),
 		maxQuotes: 1000,
-		quoteTTL:  5 * time.Minute,
 	}
 }
 
 // SetPrice updates the cached price data
+// If price changes, all cached quotes are invalidated
 func (c *QuoteCache) SetPrice(basePrice, baseStamp uint32) {
 	c.priceMu.Lock()
-	defer c.priceMu.Unlock()
+	priceChanged := c.price == nil || c.price.BasePrice != basePrice || c.price.BaseStamp != baseStamp
 	c.price = &CachedPrice{
 		BasePrice: basePrice,
 		BaseStamp: baseStamp,
 		UpdatedAt: time.Now(),
+	}
+	c.priceMu.Unlock()
+
+	// If price changed, invalidate all cached quotes
+	if priceChanged {
+		c.quotesMu.Lock()
+		c.quotes = make(map[string]*CachedQuote)
+		c.quotesMu.Unlock()
 	}
 }
 
@@ -90,13 +97,13 @@ func (c *QuoteCache) SetQuote(commitHash string, quote *PriceContractResponse) {
 	}
 
 	c.quotes[commitHash] = &CachedQuote{
-		Quote:     quote,
-		CachedAt:  time.Now(),
-		ExpiresAt: time.Now().Add(c.quoteTTL),
+		Quote:    quote,
+		CachedAt: time.Now(),
 	}
 }
 
-// GetQuote retrieves a quote by commit_hash, returns nil if not found or expired
+// GetQuote retrieves a quote by commit_hash, returns nil if not found
+// Quotes are invalidated by price changes in SetPrice, not by TTL
 func (c *QuoteCache) GetQuote(commitHash string) *PriceContractResponse {
 	c.quotesMu.RLock()
 	defer c.quotesMu.RUnlock()
@@ -105,26 +112,7 @@ func (c *QuoteCache) GetQuote(commitHash string) *PriceContractResponse {
 	if !exists {
 		return nil
 	}
-	if time.Now().After(cached.ExpiresAt) {
-		return nil
-	}
 	return cached.Quote
-}
-
-// CleanupExpired removes expired quotes from the cache
-func (c *QuoteCache) CleanupExpired() int {
-	c.quotesMu.Lock()
-	defer c.quotesMu.Unlock()
-
-	now := time.Now()
-	cleaned := 0
-	for k, v := range c.quotes {
-		if now.After(v.ExpiresAt) {
-			delete(c.quotes, k)
-			cleaned++
-		}
-	}
-	return cleaned
 }
 
 // QuoteCount returns the current number of cached quotes

@@ -1047,6 +1047,10 @@ func main() {
 		metricsMiddleware("create", server.rateLimitMiddleware(http.HandlerFunc(server.handleCreate)))))
 	http.Handle("/api/price", panicRecoveryMiddleware(
 		metricsMiddleware("price", http.HandlerFunc(server.handlePrice))))
+	http.Handle("/api/price/latest", panicRecoveryMiddleware(
+		metricsMiddleware("price_latest", http.HandlerFunc(server.handlePriceLatest))))
+	http.Handle("/api/v3/simple/price", panicRecoveryMiddleware(
+		metricsMiddleware("price_coingecko", http.HandlerFunc(server.handleCoinGeckoPrice))))
 	http.Handle("/webhook/ducat", panicRecoveryMiddleware(
 		metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook)))))
 	http.Handle("/health", panicRecoveryMiddleware(http.HandlerFunc(handleHealth)))
@@ -1068,7 +1072,9 @@ func main() {
 	logger.Info("Endpoints registered",
 		zap.Strings("endpoints", []string{
 			"GET /api/quote?th=PRICE - Create threshold commitment",
-			"GET /api/price - Get latest cached price",
+			"GET /api/price - Get latest cached price (mempool format)",
+			"GET /api/price/latest - Get latest price (Ducat Protocol format)",
+			"GET /api/v3/simple/price - Get latest price (CoinGecko format)",
 			"POST /webhook/ducat - CRE callback endpoint",
 			"GET /health - Liveness probe (simple health check)",
 			"GET /readiness - Readiness probe (dependency checks)",
@@ -1954,6 +1960,114 @@ func (s *GatewayServer) handlePrice(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"USD":  float64(cached.BasePrice),
 		"time": cached.BaseStamp,
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// GET /api/v3/simple/price - CoinGecko-compatible price endpoint
+// Returns price in format: {"bitcoin": {"usd": 96000}}
+// Query params: ids (required), vs_currencies (required)
+func (s *GatewayServer) handleCoinGeckoPrice(w http.ResponseWriter, r *http.Request) {
+	// Set CORS headers
+	allowedOrigin := os.Getenv("ALLOWED_ORIGINS")
+	if allowedOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	// Validate query params (for compatibility, but we only support bitcoin/usd)
+	ids := r.URL.Query().Get("ids")
+	vsCurrencies := r.URL.Query().Get("vs_currencies")
+
+	if ids == "" || vsCurrencies == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Missing required parameters: ids and vs_currencies",
+		})
+		return
+	}
+
+	// We only support bitcoin and usd
+	if !strings.Contains(strings.ToLower(ids), "bitcoin") {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Unsupported coin. Only 'bitcoin' is supported.",
+		})
+		return
+	}
+
+	if !strings.Contains(strings.ToLower(vsCurrencies), "usd") {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Unsupported currency. Only 'usd' is supported.",
+		})
+		return
+	}
+
+	cached := s.quoteCache.GetPrice()
+	if cached == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":   "no price available",
+			"message": "price data is stale or not yet received",
+		})
+		return
+	}
+
+	// Return CoinGecko-compatible format
+	response := map[string]interface{}{
+		"bitcoin": map[string]interface{}{
+			"usd": float64(cached.BasePrice),
+		},
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// GET /api/price/latest - Ducat Protocol format price endpoint
+// Returns price in format: {"origin": "cre", "price": 96000, "stamp": 1768450624}
+func (s *GatewayServer) handlePriceLatest(w http.ResponseWriter, r *http.Request) {
+	// Set CORS headers
+	allowedOrigin := os.Getenv("ALLOWED_ORIGINS")
+	if allowedOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	cached := s.quoteCache.GetPrice()
+	if cached == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":   "no price available",
+			"message": "price data is stale or not yet received",
+		})
+		return
+	}
+
+	// Return Ducat Protocol format
+	response := map[string]interface{}{
+		"origin": "cre",
+		"price":  float64(cached.BasePrice),
+		"stamp":  cached.BaseStamp,
 	}
 
 	w.WriteHeader(http.StatusOK)

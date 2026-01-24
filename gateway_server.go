@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"os"
@@ -691,7 +692,7 @@ type PriceQuoteResponse struct {
 
 	// Threshold commitment
 	TholdHash  string  `json:"thold_hash"`
-	TholdKey   *string `json:"thold_key,omitempty"`
+	TholdKey   *string `json:"thold_key"`
 	TholdPrice float64 `json:"thold_price"`
 
 	// State & signatures
@@ -1222,14 +1223,16 @@ func (rw *responseWriter) WriteHeader(code int) {
 //   - 500: internal error (no cached price, calculation failure, etc).
 //   - 503: server at capacity (too many pending requests).
 func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
-	// Set restrictive CORS headers - only allow configured origins
-	// For production, configure ALLOWED_ORIGINS environment variable
-	allowedOrigin := os.Getenv("ALLOWED_ORIGINS")
-	if allowedOrigin == "" {
-		// Default: no CORS (same-origin only)
-		// In development, you can set ALLOWED_ORIGINS=* but this is NOT recommended for production
-	} else {
-		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+	// Set CORS headers - check if request origin is in allowed list
+	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
+	if allowedOrigins != "" {
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if origin == strings.TrimSpace(allowed) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -1265,8 +1268,6 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tholdPrice := uint32(th)
-
 	// Step 1: Get cached price data
 	cachedPrice := s.quoteCache.GetPrice()
 	if cachedPrice == nil {
@@ -1275,9 +1276,49 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Debug("Using cached price",
-		zap.Uint32("base_price", cachedPrice.BasePrice),
-		zap.Uint32("base_stamp", cachedPrice.BaseStamp),
+	// Step 1.5: Align requested thold_price to CRE's rate step intervals
+	// CRE generates quotes at discrete rate steps (1.35 to 5.00 in 0.01 increments)
+	// Formula: thold_price = base_price * liquidation_thold / rate
+	// We need to find the closest rate step and use its corresponding thold_price
+	const (
+		liquidationThold = 1.35
+		rateMin          = 1.35
+		rateMax          = 5.00
+		stepSize         = 0.01
+	)
+
+	basePrice := float64(cachedPrice.BasePrice)
+	requestedTholdPrice := th
+
+	// Calculate the implied rate from the requested thold_price
+	// rate = base_price * liquidation_thold / thold_price
+	impliedRate := basePrice * liquidationThold / requestedTholdPrice
+
+	// Clamp to valid range
+	if impliedRate < rateMin {
+		impliedRate = rateMin
+	}
+	if impliedRate > rateMax {
+		impliedRate = rateMax
+	}
+
+	// Round to the nearest step (0.01)
+	alignedRate := math.Round(impliedRate/stepSize) * stepSize
+
+	// Recalculate the aligned thold_price using the same formula as CRE
+	alignedTholdPrice := basePrice * liquidationThold / alignedRate
+	tholdPrice := uint32(math.Floor(alignedTholdPrice))
+
+	// DEBUG: Log all values used for commit_hash calculation
+	s.logger.Info("COMMIT_HASH_DEBUG: cached price values",
+		zap.Uint32("cached_base_price", cachedPrice.BasePrice),
+		zap.Uint32("cached_base_stamp", cachedPrice.BaseStamp),
+		zap.Float64("requested_thold_price", requestedTholdPrice),
+		zap.Float64("implied_rate", impliedRate),
+		zap.Float64("aligned_rate", alignedRate),
+		zap.Uint32("aligned_thold_price", tholdPrice),
+		zap.String("oracle_pubkey", s.config.OraclePubkey),
+		zap.String("chain_network", s.config.ChainNetwork),
 	)
 
 	// Step 2: Calculate commit_hash locally (d-tag for Nostr lookup)
@@ -1296,8 +1337,8 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Debug("Calculated commit_hash",
-		zap.String("commit_hash", commitHash),
+	s.logger.Info("COMMIT_HASH_DEBUG: calculated commit_hash",
+		zap.String("calculated_commit_hash", commitHash),
 		zap.Uint32("thold_price", tholdPrice),
 	)
 
@@ -1322,8 +1363,12 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	} else if quote != nil {
 		// Found in Nostr! Cache it and return
 		s.quoteCache.SetQuote(commitHash, quote)
-		s.logger.Info("Quote served from Nostr relay",
+		s.logger.Info("COMMIT_HASH_DEBUG: Quote FOUND in Nostr",
 			zap.String("commit_hash", commitHash),
+			zap.Float64("nostr_base_price", quote.BasePrice),
+			zap.Int64("nostr_base_stamp", quote.BaseStamp),
+			zap.Float64("nostr_thold_price", quote.TholdPrice),
+			zap.String("nostr_commit_hash", quote.CommitHash),
 		)
 		collateralRatio := CalculateCollateralRatio(cachedPrice.BasePrice, tholdPrice)
 		s.sendQuoteResponse(w, quote, collateralRatio)
@@ -1331,8 +1376,11 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 5: Fall back to CRE workflow
-	s.logger.Info("Quote not found in cache or Nostr, falling back to CRE",
-		zap.String("commit_hash", commitHash),
+	s.logger.Info("COMMIT_HASH_DEBUG: Quote NOT FOUND, falling back to CRE",
+		zap.String("calculated_commit_hash", commitHash),
+		zap.Uint32("used_base_price", cachedPrice.BasePrice),
+		zap.Uint32("used_base_stamp", cachedPrice.BaseStamp),
+		zap.Uint32("used_thold_price", tholdPrice),
 	)
 	s.fallbackToCRE(w, th)
 }
@@ -1765,8 +1813,15 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	s.markWebhookProcessed(payload.EventID)
 
 	// Cache price data from webhook for the new quote flow
-	// This allows handleCreate to serve quotes without calling CRE
-	s.cacheWebhookPrice(&payload)
+	// Only update price cache for batch_generated events (from cron)
+	// On-demand "create" events should NOT overwrite the cron price because
+	// they have different timestamps and would break Nostr commit_hash lookups
+	if payload.EventType == "batch_generated" {
+		s.cacheWebhookPrice(&payload)
+		s.logger.Info("Cached price from batch_generated webhook",
+			zap.String("event_id", truncateEventID(payload.EventID)),
+		)
+	}
 
 	// SECURITY: Extract domain from tags to match pending request
 	// Domain tag is REQUIRED - no fallback to event_id to prevent spoofing
@@ -1970,10 +2025,16 @@ func (s *GatewayServer) handlePrice(w http.ResponseWriter, r *http.Request) {
 // Returns price in format: {"bitcoin": {"usd": 96000}}
 // Query params: ids (required), vs_currencies (required)
 func (s *GatewayServer) handleCoinGeckoPrice(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers
-	allowedOrigin := os.Getenv("ALLOWED_ORIGINS")
-	if allowedOrigin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+	// Set CORS headers - check if request origin is in allowed list
+	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
+	if allowedOrigins != "" {
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if origin == strings.TrimSpace(allowed) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -2038,10 +2099,16 @@ func (s *GatewayServer) handleCoinGeckoPrice(w http.ResponseWriter, r *http.Requ
 // GET /api/price/latest - Ducat Protocol format price endpoint
 // Returns price in format: {"origin": "cre", "price": 96000, "stamp": 1768450624}
 func (s *GatewayServer) handlePriceLatest(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers
-	allowedOrigin := os.Getenv("ALLOWED_ORIGINS")
-	if allowedOrigin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+	// Set CORS headers - check if request origin is in allowed list
+	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
+	if allowedOrigins != "" {
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if origin == strings.TrimSpace(allowed) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")

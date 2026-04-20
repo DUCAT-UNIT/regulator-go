@@ -247,6 +247,7 @@ const webhookCacheTTL = 5 * time.Minute
 // GatewayServer encapsulates all server state
 type GatewayServer struct {
 	config          *GatewayConfig
+	tholdToCommitCache map[string]string // thold_hash -> commit_hash from create webhooks
 	privateKey      *ecdsa.PrivateKey
 	logger          *zap.Logger
 	pendingRequests map[string]*PendingRequest
@@ -1344,8 +1345,16 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Step 3: Try local cache first
 	if quote := s.quoteCache.GetQuote(commitHash); quote != nil {
+		// Also cache thold->commit for later evaluate resolution
+		if quote.TholdHash != "" && commitHash != "" {
+			if s.tholdToCommitCache == nil {
+				s.tholdToCommitCache = make(map[string]string)
+			}
+			s.tholdToCommitCache[quote.TholdHash] = commitHash
+		}
 		s.logger.Info("Quote served from local cache",
 			zap.String("commit_hash", commitHash),
+			zap.String("thold_hash", quote.TholdHash),
 		)
 		collateralRatio := CalculateCollateralRatio(cachedPrice.BasePrice, tholdPrice)
 		s.sendQuoteResponse(w, quote, collateralRatio)
@@ -1363,6 +1372,13 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	} else if quote != nil {
 		// Found in Nostr! Cache it and return
 		s.quoteCache.SetQuote(commitHash, quote)
+		// Cache thold->commit for later evaluate resolution
+		if quote.TholdHash != "" && commitHash != "" {
+			if s.tholdToCommitCache == nil {
+				s.tholdToCommitCache = make(map[string]string)
+			}
+			s.tholdToCommitCache[quote.TholdHash] = commitHash
+		}
 		s.logger.Info("COMMIT_HASH_DEBUG: Quote FOUND in Nostr",
 			zap.String("commit_hash", commitHash),
 			zap.Float64("nostr_base_price", quote.BasePrice),
@@ -1811,6 +1827,46 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	// Mark webhook as processed AFTER all validations pass
 	s.markWebhookProcessed(payload.EventID)
+
+	// Republish ALL webhook events to relay so evaluate can find them later by commit_hash/thold_hash
+	go func(p WebhookPayload) {
+		event := &NostrEvent{
+			ID:        p.EventID,
+			PubKey:    p.PubKey,
+			CreatedAt: p.CreatedAt,
+			Kind:      p.Kind,
+			Tags:      p.Tags,
+			Content:   p.Content,
+			Sig:       p.Sig,
+		}
+		if err := s.nostrClient.PublishEvent(event); err != nil {
+			s.logger.Warn("Failed to republish event to relay",
+				zap.String("event_id", truncateEventID(p.EventID)),
+				zap.String("event_type", p.EventType),
+				zap.Error(err),
+			)
+		}
+	}(payload)
+
+	// Cache thold_hash -> commit_hash from webhook content for later evaluate resolution
+	if payload.Content != "" {
+		var webhookContent struct {
+			TholdHash  string `json:"thold_hash"`
+			CommitHash string `json:"commit_hash"`
+		}
+		if json.Unmarshal([]byte(payload.Content), &webhookContent) == nil {
+			if isValidHex(webhookContent.TholdHash, 40) && isValidHex(webhookContent.CommitHash, 64) {
+				if s.tholdToCommitCache == nil {
+					s.tholdToCommitCache = make(map[string]string)
+				}
+				s.tholdToCommitCache[webhookContent.TholdHash] = webhookContent.CommitHash
+				s.logger.Debug("Cached thold->commit mapping",
+					zap.String("thold_hash", webhookContent.TholdHash[:16]),
+					zap.String("commit_hash", webhookContent.CommitHash[:16]),
+				)
+			}
+		}
+	}
 
 	// Cache price data from webhook for the new quote flow
 	// Only update price cache for batch_generated events (from cron)
@@ -2687,25 +2743,108 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 		return
 	}
 
-	// Collect all valid thold_hashes
-	var tholdHashes []string
+	// Resolve thold_hashes to commit_hashes.
+	// Strategy 1: Search the relay for existing events containing each thold_hash.
+	// Strategy 2: For unresolved hashes, compute commit_hash from cached price (may not match
+	//             if the vault was opened at a different price, but lets CRE try).
+	var uniqueTholdHashes []string
+	seen := make(map[string]bool)
 	for _, vault := range vaults {
-		// Skip if thold_hash is empty or invalid (must be 40 hex chars)
-		// Use isValidHex to prevent injection attacks via malformed data
 		if !isValidHex(vault.TholdHash, 40) {
-			s.logger.Debug("Skipping vault with invalid thold_hash",
-				zap.String("vault_id", vault.VaultID),
-				zap.String("thold_hash", vault.TholdHash),
-			)
 			continue
 		}
-		tholdHashes = append(tholdHashes, vault.TholdHash)
+		if !seen[vault.TholdHash] {
+			seen[vault.TholdHash] = true
+			uniqueTholdHashes = append(uniqueTholdHashes, vault.TholdHash)
+		}
 	}
 
-	if len(tholdHashes) == 0 {
+	if len(uniqueTholdHashes) == 0 {
 		s.logger.Debug("No valid thold_hashes to evaluate")
 		return
 	}
+
+	// Strategy 0: Check in-memory cache from previous create/batch webhooks
+	resolved := make(map[string]string)
+	var unresolvedHashes []string
+	for _, th := range uniqueTholdHashes {
+		if ch, ok := s.tholdToCommitCache[th]; ok {
+			resolved[th] = ch
+		} else {
+			unresolvedHashes = append(unresolvedHashes, th)
+		}
+	}
+
+	// Strategy 1: Relay lookup for remaining unresolved hashes
+	if len(unresolvedHashes) > 0 {
+		relayResolved, err := s.nostrClient.ResolveCommitHashesByTholdHashes(unresolvedHashes)
+		if err != nil {
+			s.logger.Warn("Relay thold->commit resolution failed", zap.Error(err))
+		} else {
+			for k, v := range relayResolved {
+				resolved[k] = v
+			}
+		}
+	}
+
+
+	// Strategy 2: Local computation fallback for unresolved hashes
+	cachedPrice := s.quoteCache.GetPrice()
+	commitSeen := make(map[string]bool)
+	var commitHashes []string
+	for _, th := range uniqueTholdHashes {
+		if ch, ok := resolved[th]; ok && ch != "" {
+			if !commitSeen[ch] {
+				commitSeen[ch] = true
+				commitHashes = append(commitHashes, ch)
+			}
+			continue
+		}
+		// Fallback: compute from cached price
+		if cachedPrice == nil {
+			continue
+		}
+		// Find thold_price for this hash from vault data
+		var tholdPrice float64
+		for _, v := range vaults {
+			if v.TholdHash == th {
+				tholdPrice = v.TholdPrice
+				break
+			}
+		}
+		if tholdPrice == 0 {
+			continue
+		}
+		ch, cerr := CalculateCommitHash(
+			s.config.OraclePubkey,
+			s.config.ChainNetwork,
+			cachedPrice.BasePrice,
+			cachedPrice.BaseStamp,
+			uint32(tholdPrice),
+		)
+		if cerr != nil {
+			continue
+		}
+		if !commitSeen[ch] {
+			commitSeen[ch] = true
+			commitHashes = append(commitHashes, ch)
+		}
+	}
+
+	if len(commitHashes) == 0 {
+		s.logger.Info("No commit_hashes resolved for CRE evaluate",
+			zap.Int("thold_hashes", len(uniqueTholdHashes)),
+		)
+		return
+	}
+
+	s.logger.Info("Resolved thold_hashes to commit_hashes",
+		zap.Int("input_thold_hashes", len(uniqueTholdHashes)),
+		zap.Int("relay_resolved", len(resolved)),
+		zap.Int("unique_commit_hashes", len(commitHashes)),
+	)
+
+	tholdHashes := commitHashes
 
 	// CRE has a 30KB maximum request size limit (including headers and body).
 	// Each thold_hash is ~45 bytes (40 hex chars + JSON overhead).

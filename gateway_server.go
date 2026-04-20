@@ -261,6 +261,15 @@ type GatewayServer struct {
 	// Quote caching for new flow
 	quoteCache  *QuoteCache
 	nostrClient *NostrClient
+
+	// Cross-poll dedup: track recently-triggered evaluate commit_hashes to avoid
+	// re-triggering the same hash every liquidation poll cycle.
+	recentEvaluateHashes   map[string]time.Time
+	recentEvaluateHashesMu sync.Mutex
+
+	// Liquidation poller backoff state for 429 rate-limit responses.
+	liqBackoffMu       sync.Mutex
+	liqBackoffInterval time.Duration // current backoff; 0 means use normal interval
 }
 
 // isWebhookReplayed checks if a webhook has already been processed (replay attack prevention)
@@ -839,7 +848,8 @@ func init() {
 		circuitBreaker:    NewCircuitBreaker(5, 30*time.Second),
 		processedWebhooks: make(map[string]time.Time),
 		quoteCache:        NewQuoteCache(),
-		nostrClient:       NewNostrClient(config.NostrRelayURL, config.OraclePubkey, logger),
+		nostrClient:          NewNostrClient(config.NostrRelayURL, config.OraclePubkey, logger),
+		recentEvaluateHashes: make(map[string]time.Time),
 	}
 
 	logger.Info("Gateway server initialized",
@@ -2613,6 +2623,89 @@ var (
 	)
 )
 
+
+const (
+	// evaluateHashTTL is how long a successfully-triggered commit_hash is
+	// remembered, preventing the liquidation poller from re-sending it.
+	evaluateHashTTL = 2 * time.Minute
+
+	// liqBackoffMax caps the exponential backoff for the liquidation poller
+	// when the CRE gateway returns 429 rate-limit errors.
+	liqBackoffMax = 5 * time.Minute
+)
+
+// isRateLimitError returns true when CRE/gateway reported a rate-limit condition.
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errLower := strings.ToLower(err.Error())
+	return strings.Contains(errLower, "status 429") || strings.Contains(errLower, "rate limit")
+}
+
+// filterRecentlyTriggered removes commit_hashes that were already triggered
+// within the evaluateHashTTL window. Also evicts expired entries.
+func (s *GatewayServer) filterRecentlyTriggered(hashes []string) []string {
+	s.recentEvaluateHashesMu.Lock()
+	defer s.recentEvaluateHashesMu.Unlock()
+
+	now := time.Now()
+	for h, t := range s.recentEvaluateHashes {
+		if now.Sub(t) > evaluateHashTTL {
+			delete(s.recentEvaluateHashes, h)
+		}
+	}
+
+	var filtered []string
+	for _, h := range hashes {
+		if _, ok := s.recentEvaluateHashes[h]; !ok {
+			filtered = append(filtered, h)
+		}
+	}
+	return filtered
+}
+
+// recordTriggeredHashes marks commit_hashes as recently triggered.
+func (s *GatewayServer) recordTriggeredHashes(hashes []string) {
+	s.recentEvaluateHashesMu.Lock()
+	defer s.recentEvaluateHashesMu.Unlock()
+	now := time.Now()
+	for _, h := range hashes {
+		s.recentEvaluateHashes[h] = now
+	}
+}
+
+// liqRecordRateLimit doubles the liquidation poller backoff (capped at liqBackoffMax).
+func (s *GatewayServer) liqRecordRateLimit() {
+	s.liqBackoffMu.Lock()
+	defer s.liqBackoffMu.Unlock()
+	if s.liqBackoffInterval == 0 {
+		s.liqBackoffInterval = s.config.LiquidationInterval * 2
+	} else {
+		s.liqBackoffInterval *= 2
+	}
+	if s.liqBackoffInterval > liqBackoffMax {
+		s.liqBackoffInterval = liqBackoffMax
+	}
+}
+
+// liqResetBackoff resets the liquidation poller to the normal interval.
+func (s *GatewayServer) liqResetBackoff() {
+	s.liqBackoffMu.Lock()
+	defer s.liqBackoffMu.Unlock()
+	s.liqBackoffInterval = 0
+}
+
+// liqCurrentInterval returns the current effective poll interval.
+func (s *GatewayServer) liqCurrentInterval() time.Duration {
+	s.liqBackoffMu.Lock()
+	defer s.liqBackoffMu.Unlock()
+	if s.liqBackoffInterval > 0 {
+		return s.liqBackoffInterval
+	}
+	return s.config.LiquidationInterval
+}
+
 // pollLiquidationService periodically polls the liquidation service for at-risk vaults.
 // It runs every config.LiquidationInterval (default 90 seconds) and logs at-risk vault info.
 // This allows the gateway to be aware of vaults that may need liquidation and can trigger
@@ -2626,15 +2719,15 @@ func (s *GatewayServer) pollLiquidationService() {
 	// Do an initial poll immediately
 	s.doLiquidationPoll()
 
-	ticker := time.NewTicker(s.config.LiquidationInterval)
-	defer ticker.Stop()
-
 	for {
+		interval := s.liqCurrentInterval()
+		timer := time.NewTimer(interval)
 		select {
 		case <-s.shutdownChan:
+			timer.Stop()
 			s.logger.Info("Liquidation poller received shutdown signal")
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			s.doLiquidationPoll()
 		}
 	}
@@ -2855,6 +2948,24 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 	totalVaults := len(tholdHashes)
 	numBatches := (totalVaults + batchSize - 1) / batchSize
 
+	// Cross-poll dedup: skip hashes that were already triggered recently.
+	beforeDedup := len(tholdHashes)
+	tholdHashes = s.filterRecentlyTriggered(tholdHashes)
+	if skipped := beforeDedup - len(tholdHashes); skipped > 0 {
+		s.logger.Info("Skipped recently-triggered evaluate hashes",
+			zap.Int("skipped", skipped),
+			zap.Int("remaining", len(tholdHashes)),
+			zap.Duration("ttl", evaluateHashTTL),
+		)
+	}
+	if len(tholdHashes) == 0 {
+		s.logger.Info("All evaluate hashes recently triggered; skipping CRE evaluate this cycle")
+		return
+	}
+
+	totalVaults = len(tholdHashes)
+	numBatches = (totalVaults + batchSize - 1) / batchSize
+
 	s.logger.Info("Triggering CRE evaluate for at-risk vaults",
 		zap.Int("total_vaults", totalVaults),
 		zap.Int("batch_size", batchSize),
@@ -2863,6 +2974,7 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 
 	successCount := 0
 	errorCount := 0
+	hitRateLimit := false
 
 	for i := 0; i < totalVaults; i += batchSize {
 		end := i + batchSize
@@ -2885,6 +2997,14 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 			)
 			errorCount++
 			liquidationCheckTriggers.WithLabelValues("error").Inc()
+			if isRateLimitError(err) {
+				hitRateLimit = true
+				s.logger.Warn("CRE rate limit detected; aborting remaining evaluate batches",
+					zap.Int("batch", batchNum),
+					zap.Int("remaining_batches", numBatches-batchNum),
+				)
+				break
+			}
 		} else {
 			s.logger.Info("Triggered evaluate workflow batch",
 				zap.Int("batch", batchNum),
@@ -2894,6 +3014,7 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 			)
 			successCount++
 			liquidationCheckTriggers.WithLabelValues("success").Inc()
+			s.recordTriggeredHashes(batch)
 		}
 
 		// Delay between batches to avoid CRE rate limits (429 errors observed at 500ms)
@@ -2901,6 +3022,16 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 		if end < totalVaults {
 			time.Sleep(10 * time.Second)
 		}
+	}
+
+	// Update liquidation poller backoff based on this cycle's outcome.
+	if hitRateLimit {
+		s.liqRecordRateLimit()
+		s.logger.Warn("Liquidation poller backing off due to CRE rate limit",
+			zap.Duration("next_interval", s.liqCurrentInterval()),
+		)
+	} else if successCount > 0 {
+		s.liqResetBackoff()
 	}
 
 	s.logger.Info("Completed triggering evaluate workflow batches",

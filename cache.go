@@ -36,19 +36,31 @@ func NewQuoteCache() *QuoteCache {
 	}
 }
 
-// SetPrice updates the cached price data
-// If price changes, all cached quotes are invalidated
+// SetPrice updates the cached price data.
+//
+// When base_price is unchanged, we keep the existing base_stamp so that
+// commit_hash lookups continue to match quotes already in local cache and
+// on the relay. CRE batches all use the same (price, stamp) snapshot;
+// subsequent webhook arrivals for the same price level should not rotate
+// the stamp and invalidate every cached quote.
+//
+// When base_price actually changes, the stamp is updated and all cached
+// quotes are flushed because their commit_hashes are no longer valid.
 func (c *QuoteCache) SetPrice(basePrice, baseStamp uint32) {
 	c.priceMu.Lock()
-	priceChanged := c.price == nil || c.price.BasePrice != basePrice || c.price.BaseStamp != baseStamp
-	c.price = &CachedPrice{
-		BasePrice: basePrice,
-		BaseStamp: baseStamp,
-		UpdatedAt: time.Now(),
+	priceChanged := c.price == nil || c.price.BasePrice != basePrice
+	if priceChanged {
+		c.price = &CachedPrice{
+			BasePrice: basePrice,
+			BaseStamp: baseStamp,
+			UpdatedAt: time.Now(),
+		}
+	} else {
+		// Same price — only refresh the liveness timestamp, keep base_stamp stable
+		c.price.UpdatedAt = time.Now()
 	}
 	c.priceMu.Unlock()
 
-	// If price changed, invalidate all cached quotes
 	if priceChanged {
 		c.quotesMu.Lock()
 		c.quotes = make(map[string]*CachedQuote)

@@ -74,14 +74,21 @@ type GatewayConfig struct {
 	ExpectedWebhookPubKey string
 
 	// Liquidation service configuration
-	LiquidationURL      string        // URL of the liquidation service endpoint
-	LiquidationInterval time.Duration // How often to poll the liquidation service
-	LiquidationEnabled  bool          // Whether to enable liquidation polling
+	LiquidationURL              string        // URL of the liquidation service endpoint
+	LiquidationInterval         time.Duration // How often to poll the liquidation service
+	LiquidationEnabled          bool          // Whether to enable liquidation polling
+	LiquidationMaxHashesPerPoll int           // Max at-risk hashes to evaluate per poll cycle
 
 	// Nostr relay configuration for quote lookup
 	NostrRelayURL string // URL of the Nostr relay HTTP API
 	OraclePubkey  string // Oracle's Schnorr public key for Nostr events (32 bytes hex)
 	ChainNetwork  string // Chain network identifier (e.g., "mutiny", "mainnet")
+
+	// Optional prefilter before CRE evaluate: only send hashes that currently exist in Nostr
+	NostrPrefilterEnabled    bool
+	NostrPrefilterWorkers    int
+	NostrPrefilterCacheTTL   time.Duration
+	NostrPrefilterFailClosed bool
 }
 
 // IPRateLimiter manages per-IP rate limiters with automatic cleanup
@@ -244,10 +251,12 @@ func (cb *CircuitBreaker) State() string {
 // webhookCacheTTL is how long processed webhook event IDs are cached (5 minutes)
 const webhookCacheTTL = 5 * time.Minute
 
+// nostrExistenceCacheMaxSize prevents unbounded growth for relay existence checks.
+const nostrExistenceCacheMaxSize = 200000
+
 // GatewayServer encapsulates all server state
 type GatewayServer struct {
 	config          *GatewayConfig
-	tholdToCommitCache map[string]string // thold_hash -> commit_hash from create webhooks
 	privateKey      *ecdsa.PrivateKey
 	logger          *zap.Logger
 	pendingRequests map[string]*PendingRequest
@@ -261,6 +270,49 @@ type GatewayServer struct {
 	// Quote caching for new flow
 	quoteCache  *QuoteCache
 	nostrClient *NostrClient
+
+	// Cache for thold_hash -> "exists in Nostr relay" checks.
+	nostrExistenceCache map[string]nostrExistenceEntry
+	nostrExistenceMu    sync.RWMutex
+
+	// Per-commit-hash lock map prevents duplicate concurrent CRE create calls.
+	quoteCreateLocks map[string]*sync.Mutex
+	quoteCreateMu    sync.Mutex
+
+	// Cross-poll dedup: track recently-triggered evaluate commit_hashes to avoid
+	// re-triggering the same hash every liquidation poll cycle.
+	recentEvaluateHashes   map[string]time.Time
+	recentEvaluateHashesMu sync.Mutex
+
+	// Liquidation poller backoff state for 429 rate-limit responses.
+	liqBackoffMu       sync.Mutex
+	liqBackoffInterval time.Duration // current backoff; 0 means use normal interval
+
+	// State used by liquidation polling when capping large at-risk sets.
+	// New hashes are prioritized; existing hashes are rotated for fairness.
+	liquidationSeenHashes      map[string]struct{}
+	liquidationSeenInitialized bool
+	liquidationSeenMu          sync.Mutex
+	liquidationSelectionCursor int
+	liquidationSelectionMu     sync.Mutex
+}
+
+type nostrExistenceEntry struct {
+	exists    bool
+	checkedAt time.Time
+}
+
+func (s *GatewayServer) getQuoteCreateLock(commitHash string) *sync.Mutex {
+	s.quoteCreateMu.Lock()
+	defer s.quoteCreateMu.Unlock()
+
+	if lock, ok := s.quoteCreateLocks[commitHash]; ok {
+		return lock
+	}
+
+	lock := &sync.Mutex{}
+	s.quoteCreateLocks[commitHash] = lock
+	return lock
 }
 
 // isWebhookReplayed checks if a webhook has already been processed (replay attack prevention)
@@ -658,12 +710,14 @@ type CheckRequest struct {
 type WebhookPayload struct {
 	EventType  string                 `json:"event_type"`
 	EventID    string                 `json:"event_id"`
+	Domain     string                 `json:"domain,omitempty"`
 	PubKey     string                 `json:"pubkey"`
 	CreatedAt  int64                  `json:"created_at"`
 	Kind       int                    `json:"kind"`
 	Tags       [][]string             `json:"tags"`
 	Content    string                 `json:"content"`
 	Sig        string                 `json:"sig"`
+	Data       json.RawMessage        `json:"data,omitempty"`
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
@@ -830,16 +884,20 @@ func init() {
 	// Initialize server with config
 	// Circuit breaker: 5 failures opens circuit, 30 second reset timeout
 	server = &GatewayServer{
-		config:            config,
-		privateKey:        privateKey,
-		logger:            logger,
-		pendingRequests:   make(map[string]*PendingRequest),
-		shutdownChan:      make(chan struct{}),
-		ipRateLimiter:     NewIPRateLimiter(config.IPRateLimit, config.IPBurstLimit),
-		circuitBreaker:    NewCircuitBreaker(5, 30*time.Second),
-		processedWebhooks: make(map[string]time.Time),
-		quoteCache:        NewQuoteCache(),
-		nostrClient:       NewNostrClient(config.NostrRelayURL, config.OraclePubkey, logger),
+		config:              config,
+		privateKey:          privateKey,
+		logger:              logger,
+		pendingRequests:     make(map[string]*PendingRequest),
+		shutdownChan:        make(chan struct{}),
+		ipRateLimiter:       NewIPRateLimiter(config.IPRateLimit, config.IPBurstLimit),
+		circuitBreaker:      NewCircuitBreaker(5, 30*time.Second),
+		processedWebhooks:   make(map[string]time.Time),
+		quoteCache:          NewQuoteCache(),
+		nostrClient:         NewNostrClient(config.NostrRelayURL, config.OraclePubkey, logger),
+		nostrExistenceCache: make(map[string]nostrExistenceEntry),
+		quoteCreateLocks:    make(map[string]*sync.Mutex),
+		liquidationSeenHashes:    make(map[string]struct{}),
+		recentEvaluateHashes:    make(map[string]time.Time),
 	}
 
 	logger.Info("Gateway server initialized",
@@ -853,7 +911,12 @@ func init() {
 		zap.Bool("liquidation_enabled", config.LiquidationEnabled),
 		zap.String("liquidation_url", config.LiquidationURL),
 		zap.Duration("liquidation_interval", config.LiquidationInterval),
+		zap.Int("liquidation_max_hashes_per_poll", config.LiquidationMaxHashesPerPoll),
 		zap.String("nostr_relay_url", config.NostrRelayURL),
+		zap.Bool("nostr_prefilter_enabled", config.NostrPrefilterEnabled),
+		zap.Int("nostr_prefilter_workers", config.NostrPrefilterWorkers),
+		zap.Duration("nostr_prefilter_cache_ttl", config.NostrPrefilterCacheTTL),
+		zap.Bool("nostr_prefilter_fail_closed", config.NostrPrefilterFailClosed),
 		zap.String("chain_network", config.ChainNetwork),
 	)
 
@@ -1011,17 +1074,80 @@ func loadConfig() *GatewayConfig {
 		config.LiquidationEnabled = liquidationEnabled == "true" || liquidationEnabled == "1"
 	}
 
-	// Nostr relay configuration for quote lookup
+	maxHashesStr := os.Getenv("LIQUIDATION_MAX_HASHES_PER_POLL")
+	if maxHashesStr == "" {
+		config.LiquidationMaxHashesPerPoll = 100
+	} else {
+		if _, err := fmt.Sscanf(maxHashesStr, "%d", &config.LiquidationMaxHashesPerPoll); err != nil {
+			logFatal("Invalid LIQUIDATION_MAX_HASHES_PER_POLL: %v", err)
+		}
+		if config.LiquidationMaxHashesPerPoll <= 0 {
+			logFatal("LIQUIDATION_MAX_HASHES_PER_POLL must be > 0")
+		}
+	}
+
+	// Nostr relay configuration for quote lookup.
+	// If not explicitly configured, default to dev relay for non-mainnet.
 	config.NostrRelayURL = os.Getenv("NOSTR_RELAY_URL")
 	if config.NostrRelayURL == "" {
-		config.NostrRelayURL = "https://relay.ducat.dev" // Default
+		chainNetworkHint := strings.TrimSpace(os.Getenv("CHAIN_NETWORK"))
+		if strings.EqualFold(chainNetworkHint, "mainnet") {
+			config.NostrRelayURL = "https://relay.ducat.dev"
+		} else {
+			config.NostrRelayURL = "https://dev-relay.ducatprotocol.com"
+		}
+	}
+
+	// Optional Nostr prefilter before CRE evaluate batches.
+	// Default: enabled, 24 workers, 10 minute cache TTL.
+	nostrPrefilterEnabled := os.Getenv("NOSTR_PREFILTER_ENABLED")
+	if nostrPrefilterEnabled == "" {
+		config.NostrPrefilterEnabled = true
+	} else {
+		config.NostrPrefilterEnabled = nostrPrefilterEnabled == "true" || nostrPrefilterEnabled == "1"
+	}
+
+	nostrPrefilterWorkers := os.Getenv("NOSTR_PREFILTER_WORKERS")
+	if nostrPrefilterWorkers == "" {
+		config.NostrPrefilterWorkers = 24
+	} else {
+		if _, err := fmt.Sscanf(nostrPrefilterWorkers, "%d", &config.NostrPrefilterWorkers); err != nil {
+			logFatal("Invalid NOSTR_PREFILTER_WORKERS: %v", err)
+		}
+		if config.NostrPrefilterWorkers <= 0 {
+			logFatal("NOSTR_PREFILTER_WORKERS must be > 0")
+		}
+	}
+
+	nostrPrefilterCacheTTL := os.Getenv("NOSTR_PREFILTER_CACHE_TTL_SECONDS")
+	if nostrPrefilterCacheTTL == "" {
+		config.NostrPrefilterCacheTTL = 10 * time.Minute
+	} else {
+		var seconds int
+		if _, err := fmt.Sscanf(nostrPrefilterCacheTTL, "%d", &seconds); err != nil {
+			logFatal("Invalid NOSTR_PREFILTER_CACHE_TTL_SECONDS: %v", err)
+		}
+		if seconds <= 0 {
+			logFatal("NOSTR_PREFILTER_CACHE_TTL_SECONDS must be > 0")
+		}
+		config.NostrPrefilterCacheTTL = time.Duration(seconds) * time.Second
+	}
+
+	nostrPrefilterFailClosed := os.Getenv("NOSTR_PREFILTER_FAIL_CLOSED")
+	if nostrPrefilterFailClosed == "" {
+		config.NostrPrefilterFailClosed = true
+	} else {
+		config.NostrPrefilterFailClosed = nostrPrefilterFailClosed == "true" || nostrPrefilterFailClosed == "1"
 	}
 
 	config.OraclePubkey = os.Getenv("ORACLE_PUBKEY")
 	if config.OraclePubkey == "" {
-		// In production, this should be set - use test default for development
+		if os.Getenv("GO_TEST") != "1" && !strings.HasSuffix(os.Args[0], ".test") {
+			logFatal("ORACLE_PUBKEY environment variable not set")
+		}
+		// Keep test behavior deterministic when loadConfig is exercised without env.
 		config.OraclePubkey = "0000000000000000000000000000000000000000000000000000000000000000"
-		logWarn("ORACLE_PUBKEY not set - using test default")
+		logWarn("ORACLE_PUBKEY not set in test mode - using dummy value")
 	} else {
 		// Validate format: must be exactly 64 hex characters
 		if len(config.OraclePubkey) != 64 {
@@ -1032,9 +1158,13 @@ func loadConfig() *GatewayConfig {
 		}
 	}
 
-	config.ChainNetwork = os.Getenv("CHAIN_NETWORK")
+	config.ChainNetwork = strings.TrimSpace(os.Getenv("CHAIN_NETWORK"))
 	if config.ChainNetwork == "" {
-		config.ChainNetwork = "mutiny" // Default to mutiny testnet
+		if os.Getenv("GO_TEST") != "1" && !strings.HasSuffix(os.Args[0], ".test") {
+			logFatal("CHAIN_NETWORK environment variable not set")
+		}
+		config.ChainNetwork = "mutiny"
+		logWarn("CHAIN_NETWORK not set in test mode - using default mutiny")
 	}
 
 	return config
@@ -1047,6 +1177,14 @@ func main() {
 	// Rate limiting applied to both /api/quote and /webhook/ducat to prevent DoS
 	http.Handle("/api/quote", panicRecoveryMiddleware(
 		metricsMiddleware("create", server.rateLimitMiddleware(http.HandlerFunc(server.handleCreate)))))
+	http.Handle("/check", panicRecoveryMiddleware(
+		metricsMiddleware("check", http.HandlerFunc(server.handleCheck))))
+	http.Handle("/api/check", panicRecoveryMiddleware(
+		metricsMiddleware("check", http.HandlerFunc(server.handleCheck))))
+	http.Handle("/status/", panicRecoveryMiddleware(
+		metricsMiddleware("status", http.HandlerFunc(server.handleStatus))))
+	http.Handle("/api/status/", panicRecoveryMiddleware(
+		metricsMiddleware("status", http.HandlerFunc(server.handleStatus))))
 	http.Handle("/api/price", panicRecoveryMiddleware(
 		metricsMiddleware("price", http.HandlerFunc(server.handlePrice))))
 	http.Handle("/api/price/latest", panicRecoveryMiddleware(
@@ -1054,6 +1192,8 @@ func main() {
 	http.Handle("/api/v3/simple/price", panicRecoveryMiddleware(
 		metricsMiddleware("price_coingecko", http.HandlerFunc(server.handleCoinGeckoPrice))))
 	http.Handle("/webhook/ducat", panicRecoveryMiddleware(
+		metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook)))))
+	http.Handle("/webhook/ducat-dev", panicRecoveryMiddleware(
 		metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook)))))
 	http.Handle("/health", panicRecoveryMiddleware(http.HandlerFunc(handleHealth)))
 	http.Handle("/readiness", panicRecoveryMiddleware(http.HandlerFunc(server.handleReadiness)))
@@ -1074,10 +1214,15 @@ func main() {
 	logger.Info("Endpoints registered",
 		zap.Strings("endpoints", []string{
 			"GET /api/quote?th=PRICE - Create threshold commitment",
+			"POST /check - Check threshold breach (sync)",
+			"POST /api/check - Check threshold breach (sync)",
+			"GET /status/{request_id} - Poll async request status",
+			"GET /api/status/{request_id} - Poll async request status",
 			"GET /api/price - Get latest cached price (mempool format)",
 			"GET /api/price/latest - Get latest price (Ducat Protocol format)",
 			"GET /api/v3/simple/price - Get latest price (CoinGecko format)",
 			"POST /webhook/ducat - CRE callback endpoint",
+			"POST /webhook/ducat-dev - CRE callback endpoint (dev alias)",
 			"GET /health - Liveness probe (simple health check)",
 			"GET /readiness - Readiness probe (dependency checks)",
 			"GET /metrics - Prometheus metrics",
@@ -1206,6 +1351,79 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+func setCORSHeaders(w http.ResponseWriter, r *http.Request, methods string) {
+	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+
+	if allowedOrigins != "" {
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			allowed = strings.TrimSpace(allowed)
+			if allowed == "" {
+				continue
+			}
+			if allowed == "*" {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				break
+			}
+			if origin != "" && origin == allowed {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
+	}
+
+	w.Header().Set("Access-Control-Allow-Methods", methods)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+}
+
+func (s *GatewayServer) seedPriceCacheFromRelay() bool {
+	if s.nostrClient == nil {
+		return false
+	}
+
+	events, err := s.nostrClient.queryRecentThresholdEvents(25, nil)
+	if err != nil {
+		s.logger.Warn("Failed to query relay for price seed", zap.Error(err))
+		return false
+	}
+	if len(events) == 0 {
+		return false
+	}
+
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].CreatedAt > events[j].CreatedAt
+	})
+
+	for _, event := range events {
+		var quote PriceContractResponse
+		if err := json.Unmarshal([]byte(event.Content), &quote); err != nil {
+			continue
+		}
+
+		basePrice := uint32(quote.BasePrice)
+		baseStamp := uint32(quote.BaseStamp)
+		if basePrice == 0 || baseStamp == 0 {
+			continue
+		}
+
+		s.quoteCache.SetPrice(basePrice, baseStamp)
+		if quote.CommitHash != "" {
+			s.quoteCache.SetQuote(strings.ToLower(strings.TrimSpace(quote.CommitHash)), &quote)
+		}
+
+		s.logger.Info("Seeded price cache from relay",
+			zap.Uint32("base_price", basePrice),
+			zap.Uint32("base_stamp", baseStamp),
+			zap.String("commit_hash", quote.CommitHash),
+		)
+		return true
+	}
+
+	s.logger.Warn("Failed to seed price cache from relay: no parseable quotes")
+	return false
+}
+
 // handleCreate handles GET /api/quote?th=PRICE requests using the new flow:
 // 1. Get cached price data from webhooks
 // 2. Calculate commit_hash locally (d-tag)
@@ -1224,19 +1442,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 //   - 500: internal error (no cached price, calculation failure, etc).
 //   - 503: server at capacity (too many pending requests).
 func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers - check if request origin is in allowed list
-	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
-	if allowedOrigins != "" {
-		origin := r.Header.Get("Origin")
-		for _, allowed := range strings.Split(allowedOrigins, ",") {
-			if origin == strings.TrimSpace(allowed) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	setCORSHeaders(w, r, "GET, OPTIONS")
 
 	// Handle preflight
 	if r.Method == "OPTIONS" {
@@ -1269,12 +1475,25 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 1: Get cached price data
+
+	// Step 1: Get cached price data.
 	cachedPrice := s.quoteCache.GetPrice()
 	if cachedPrice == nil {
-		s.logger.Warn("No cached price data available, falling back to CRE")
-		s.fallbackToCRE(w, th)
-		return
+		// Deduplicate concurrent no-cache requests (e.g. just after restart) by threshold.
+		noCacheKey := fmt.Sprintf("nocache:%d", int(math.Round(th*100)))
+		createLock := s.getQuoteCreateLock(noCacheKey)
+		createLock.Lock()
+		defer createLock.Unlock()
+
+		cachedPrice = s.quoteCache.GetPrice()
+		if cachedPrice == nil && s.seedPriceCacheFromRelay() {
+			cachedPrice = s.quoteCache.GetPrice()
+		}
+		if cachedPrice == nil {
+			s.logger.Warn("No cached price data available, falling back to CRE")
+			s.fallbackToCRE(w, th, "")
+			return
+		}
 	}
 
 	// Step 1.5: Align requested thold_price to CRE's rate step intervals
@@ -1308,7 +1527,7 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Recalculate the aligned thold_price using the same formula as CRE
 	alignedTholdPrice := basePrice * liquidationThold / alignedRate
-	tholdPrice := uint32(math.Floor(alignedTholdPrice))
+	tholdPrice := uint32(math.Ceil(alignedTholdPrice))
 
 	// DEBUG: Log all values used for commit_hash calculation
 	s.logger.Info("COMMIT_HASH_DEBUG: cached price values",
@@ -1345,16 +1564,8 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Step 3: Try local cache first
 	if quote := s.quoteCache.GetQuote(commitHash); quote != nil {
-		// Also cache thold->commit for later evaluate resolution
-		if quote.TholdHash != "" && commitHash != "" {
-			if s.tholdToCommitCache == nil {
-				s.tholdToCommitCache = make(map[string]string)
-			}
-			s.tholdToCommitCache[quote.TholdHash] = commitHash
-		}
 		s.logger.Info("Quote served from local cache",
 			zap.String("commit_hash", commitHash),
-			zap.String("thold_hash", quote.TholdHash),
 		)
 		collateralRatio := CalculateCollateralRatio(cachedPrice.BasePrice, tholdPrice)
 		s.sendQuoteResponse(w, quote, collateralRatio)
@@ -1372,13 +1583,6 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	} else if quote != nil {
 		// Found in Nostr! Cache it and return
 		s.quoteCache.SetQuote(commitHash, quote)
-		// Cache thold->commit for later evaluate resolution
-		if quote.TholdHash != "" && commitHash != "" {
-			if s.tholdToCommitCache == nil {
-				s.tholdToCommitCache = make(map[string]string)
-			}
-			s.tholdToCommitCache[quote.TholdHash] = commitHash
-		}
 		s.logger.Info("COMMIT_HASH_DEBUG: Quote FOUND in Nostr",
 			zap.String("commit_hash", commitHash),
 			zap.Float64("nostr_base_price", quote.BasePrice),
@@ -1391,14 +1595,100 @@ func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 5: Fall back to CRE workflow
+	// Step 4.5: Price cache may be stale - re-seed from relay and retry commit_hash lookup.
+	if s.seedPriceCacheFromRelay() {
+		freshPrice := s.quoteCache.GetPrice()
+		if freshPrice != nil && (freshPrice.BasePrice != cachedPrice.BasePrice || freshPrice.BaseStamp != cachedPrice.BaseStamp) {
+			freshBasePrice := float64(freshPrice.BasePrice)
+			freshImpliedRate := freshBasePrice * liquidationThold / requestedTholdPrice
+			if freshImpliedRate < rateMin {
+				freshImpliedRate = rateMin
+			}
+			if freshImpliedRate > rateMax {
+				freshImpliedRate = rateMax
+			}
+			freshAlignedRate := math.Round(freshImpliedRate/stepSize) * stepSize
+			freshAlignedTholdPrice := freshBasePrice * liquidationThold / freshAlignedRate
+			freshTholdPrice := uint32(math.Ceil(freshAlignedTholdPrice))
+
+			freshCommitHash, freshErr := CalculateCommitHash(
+				s.config.OraclePubkey,
+				s.config.ChainNetwork,
+				freshPrice.BasePrice,
+				freshPrice.BaseStamp,
+				freshTholdPrice,
+			)
+			if freshErr == nil && freshCommitHash != commitHash {
+				s.logger.Info("Price cache refreshed, retrying with fresh commit_hash",
+					zap.String("stale_commit_hash", commitHash),
+					zap.String("fresh_commit_hash", freshCommitHash),
+					zap.Uint32("stale_base_price", cachedPrice.BasePrice),
+					zap.Uint32("fresh_base_price", freshPrice.BasePrice),
+				)
+
+				if freshQuote := s.quoteCache.GetQuote(freshCommitHash); freshQuote != nil {
+					collateralRatio := CalculateCollateralRatio(freshPrice.BasePrice, freshTholdPrice)
+					s.sendQuoteResponse(w, freshQuote, collateralRatio)
+					return
+				}
+
+				freshQuote, freshFetchErr := s.nostrClient.FetchQuoteByDTag(freshCommitHash)
+				if freshFetchErr == nil && freshQuote != nil {
+					s.quoteCache.SetQuote(freshCommitHash, freshQuote)
+					s.logger.Info("Quote found on retry with fresh price",
+						zap.String("commit_hash", freshCommitHash),
+					)
+					collateralRatio := CalculateCollateralRatio(freshPrice.BasePrice, freshTholdPrice)
+					s.sendQuoteResponse(w, freshQuote, collateralRatio)
+					return
+				}
+			}
+		}
+	}
+
+	// Step 4.6: Guard - CRE rejects quotes where thold_price is within 1% of current price.
+	if cachedPrice.BasePrice > 0 {
+		distance := math.Abs(float64(tholdPrice)-float64(cachedPrice.BasePrice)) / float64(cachedPrice.BasePrice)
+		if distance < 0.015 {
+			s.logger.Warn("Threshold too close to current price for CRE create",
+				zap.Uint32("thold_price", tholdPrice),
+				zap.Uint32("base_price", cachedPrice.BasePrice),
+				zap.Float64("distance_pct", distance*100),
+			)
+			response := SyncResponse{
+				Status:  "timeout",
+				Message: "Quote unavailable: threshold too close to current price",
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+	}
+
+	// Step 5: Fall back to CRE workflow.
+	// Deduplicate concurrent misses on the same commit hash to avoid CRE rate-limit bursts.
+	createLock := s.getQuoteCreateLock(commitHash)
+	createLock.Lock()
+	defer createLock.Unlock()
+
+	if quote := s.quoteCache.GetQuote(commitHash); quote != nil {
+		s.logger.Info("Quote served from local cache after waiting for in-flight create",
+			zap.String("commit_hash", commitHash),
+		)
+		collateralRatio := CalculateCollateralRatio(cachedPrice.BasePrice, tholdPrice)
+		s.sendQuoteResponse(w, quote, collateralRatio)
+		return
+	}
+
 	s.logger.Info("COMMIT_HASH_DEBUG: Quote NOT FOUND, falling back to CRE",
 		zap.String("calculated_commit_hash", commitHash),
 		zap.Uint32("used_base_price", cachedPrice.BasePrice),
 		zap.Uint32("used_base_stamp", cachedPrice.BaseStamp),
 		zap.Uint32("used_thold_price", tholdPrice),
 	)
-	s.fallbackToCRE(w, th)
+	// Use aligned threshold so fallback quotes can be reused by commit-hash lookups.
+	s.fallbackToCRE(w, float64(tholdPrice), commitHash)
 }
 
 // sendQuoteResponse sends a QuoteResponse in v2.5 format with the given price contract and collateral ratio
@@ -1414,7 +1704,7 @@ func (s *GatewayServer) sendQuoteResponse(w http.ResponseWriter, quote *PriceCon
 }
 
 // fallbackToCRE triggers the CRE workflow and blocks waiting for response
-func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
+func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64, expectedCommitHash string) {
 	// Generate domain with cryptographically random component to prevent prediction attacks
 	// An attacker who can predict domains could pre-send forged webhooks
 	randomID, err := ethsign.GenerateRequestID()
@@ -1521,11 +1811,67 @@ func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
 			return
 		}
 
+		if s.quoteCache.GetPrice() == nil {
+			s.quoteCache.SetPrice(uint32(priceContract.BasePrice), uint32(priceContract.BaseStamp))
+			s.logger.Info("Seeded price cache from CRE fallback",
+				zap.Uint32("base_price", uint32(priceContract.BasePrice)),
+				zap.Uint32("base_stamp", uint32(priceContract.BaseStamp)),
+			)
+		}
+
 		// Calculate collateral ratio from the response
 		collateralRatio := CalculateCollateralRatio(uint32(priceContract.BasePrice), uint32(priceContract.TholdPrice))
 
-		// Cache the quote for future requests
+		// Cache the quote for future requests.
+		lookupCommitHash := expectedCommitHash
+		if lookupCommitHash == "" && th > 0 {
+			const (
+				liquidationThold = 1.35
+				rateMin          = 1.35
+				rateMax          = 5.00
+				stepSize         = 0.01
+			)
+
+			basePrice := float64(uint32(priceContract.BasePrice))
+			impliedRate := basePrice * liquidationThold / th
+			if impliedRate < rateMin {
+				impliedRate = rateMin
+			}
+			if impliedRate > rateMax {
+				impliedRate = rateMax
+			}
+
+			alignedRate := math.Round(impliedRate/stepSize) * stepSize
+			alignedTholdPrice := uint32(math.Floor(basePrice * liquidationThold / alignedRate))
+
+			derivedHash, hashErr := CalculateCommitHash(
+				s.config.OraclePubkey,
+				s.config.ChainNetwork,
+				uint32(priceContract.BasePrice),
+				uint32(priceContract.BaseStamp),
+				alignedTholdPrice,
+			)
+			if hashErr != nil {
+				s.logger.Warn("Failed to derive aligned commit_hash from CRE fallback",
+					zap.Error(hashErr),
+					zap.Float64("threshold_price", th),
+					zap.Uint32("aligned_thold_price", alignedTholdPrice),
+				)
+			} else {
+				lookupCommitHash = derivedHash
+			}
+		}
+
 		s.quoteCache.SetQuote(priceContract.CommitHash, &priceContract)
+		if lookupCommitHash != "" && lookupCommitHash != priceContract.CommitHash {
+			// Also cache under the lookup key to avoid repeated CRE calls on hash drift.
+			s.quoteCache.SetQuote(lookupCommitHash, &priceContract)
+			s.logger.Warn("CRE quote commit_hash mismatch with lookup key",
+				zap.String("expected_commit_hash", lookupCommitHash),
+				zap.String("payload_commit_hash", priceContract.CommitHash),
+				zap.Float64("threshold_price", th),
+			)
+		}
 
 		// Convert to v2.5 format for client-sdk
 		s.sendQuoteResponse(w, &priceContract, collateralRatio)
@@ -1555,10 +1901,11 @@ func (s *GatewayServer) fallbackToCRE(w http.ResponseWriter, th float64) {
 	}
 }
 
-// handleCheck handles POST /check requests by triggering a CRE "check" workflow and blocking until the corresponding webhook arrives or s.config.BlockTimeout elapses.
-// It validates the JSON body (domain and 40-char thold_hash), registers a PendingRequest keyed by domain (enforcing s.config.MaxPending), and invokes the workflow.
-// If a matching webhook is received before timeout, the pending request is marked completed and the parsed PriceContractResponse is returned (falls back to raw content on JSON parse failure).
-// If s.config.BlockTimeout elapses, the pending request is marked timed out and a 202 Accepted SyncResponse containing the request ID is returned for polling.
+// handleCheck handles POST /check requests.
+//
+// Fast path: attempt direct relay resolution by thold_hash so known quotes return immediately.
+// Fallback path: trigger CRE "check" workflow and block for up to s.config.BlockTimeout for webhook response.
+// On timeout, returns 202 Accepted with request_id for polling via /status.
 func (s *GatewayServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1583,121 +1930,167 @@ func (s *GatewayServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use domain as tracking key
-	trackingKey := req.Domain
-
-	// Create pending request with result channel
-	pending := &PendingRequest{
-		RequestID:  trackingKey,
-		CreatedAt:  time.Now(),
-		ResultChan: make(chan *WebhookPayload, 1),
-		Status:     "pending",
-	}
-
-	// Check if we've hit the max pending requests limit
-	s.requestsMutex.Lock()
-	currentPending := len(s.pendingRequests)
-	if currentPending >= s.config.MaxPending {
-		s.requestsMutex.Unlock()
-		logger.Warn("Max pending requests reached, rejecting CHECK request",
-			zap.Int("current_pending", currentPending),
-			zap.Int("max_pending", s.config.MaxPending),
-		)
-		http.Error(w, "Server at capacity, please retry later", http.StatusServiceUnavailable)
+	if s.nostrClient == nil {
+		http.Error(w, "Nostr relay client unavailable", http.StatusInternalServerError)
 		return
 	}
-	s.pendingRequests[trackingKey] = pending
-	currentPending = len(s.pendingRequests)
-	s.requestsMutex.Unlock()
 
-	logger.Info("CHECK request initiated",
-		zap.String("domain", req.Domain),
-		zap.String("thold_hash", req.TholdHash),
-		zap.String("tracking_key", trackingKey),
-		zap.Int("pending_count", currentPending),
-		zap.Int("max_pending", s.config.MaxPending),
-	)
-
-	// Trigger CRE workflow with configured callback URL
-	if err := s.triggerWorkflow("check", req.Domain, nil, &req.TholdHash, s.config.CallbackURL); err != nil {
-		logger.Error("Failed to trigger workflow",
+	quote, err := s.nostrClient.FetchQuoteByTholdHash(req.TholdHash)
+	if err != nil {
+		s.logger.Error("CHECK failed to fetch quote from relay",
 			zap.String("domain", req.Domain),
+			zap.String("thold_hash", req.TholdHash),
 			zap.Error(err),
 		)
+		http.Error(w, "Failed to query relay", http.StatusInternalServerError)
+		return
+	}
+	if quote == nil {
+		http.Error(w, "Quote not found", http.StatusNotFound)
+		return
+	}
+
+	if quote.CommitHash != "" {
+		s.quoteCache.SetQuote(quote.CommitHash, quote)
+	}
+
+	if quote.TholdKey != nil {
+		s.logger.Info("CHECK quote already revealed",
+			zap.String("domain", req.Domain),
+			zap.String("thold_hash", req.TholdHash),
+			zap.String("commit_hash", quote.CommitHash),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(quote)
+		return
+	}
+
+	cachedLatest := s.quoteCache.GetPrice()
+	shouldEvaluate := cachedLatest == nil
+	var latestPrice float64
+	if cachedLatest != nil {
+		latestPrice = float64(cachedLatest.BasePrice)
+		if latestPrice < quote.TholdPrice {
+			shouldEvaluate = true
+		}
+	}
+
+	if !shouldEvaluate {
+		s.logger.Info("CHECK active - latest price above/equal threshold",
+			zap.String("domain", req.Domain),
+			zap.String("thold_hash", req.TholdHash),
+			zap.Float64("latest_price", latestPrice),
+			zap.Float64("thold_price", quote.TholdPrice),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(quote)
+		return
+	}
+
+	evaluateHashes := []string{req.TholdHash}
+	if isValidHex(quote.CommitHash, 64) {
+		evaluateHashes = []string{strings.ToLower(quote.CommitHash)}
+	}
+
+	s.logger.Info("CHECK breach candidate - triggering evaluate",
+		zap.String("domain", req.Domain),
+		zap.String("thold_hash", req.TholdHash),
+		zap.Strings("evaluate_hashes", evaluateHashes),
+		zap.Float64("latest_price", latestPrice),
+		zap.Float64("thold_price", quote.TholdPrice),
+	)
+
+	evaluateDomain := fmt.Sprintf("check-%s-%d", req.Domain, time.Now().UnixNano())
+	var evaluateErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		evaluateErr = s.triggerEvaluateWorkflow(evaluateDomain, evaluateHashes, s.config.CallbackURL)
+		if evaluateErr == nil {
+			break
+		}
+		if !isRateLimitError(evaluateErr) || attempt == 3 {
+			break
+		}
+
+		backoff := time.Duration(attempt*2) * time.Second
+		s.logger.Warn("CHECK evaluate trigger rate-limited; retrying",
+			zap.String("domain", req.Domain),
+			zap.String("evaluate_domain", evaluateDomain),
+			zap.String("thold_hash", req.TholdHash),
+			zap.Strings("evaluate_hashes", evaluateHashes),
+			zap.Int("attempt", attempt),
+			zap.Duration("backoff", backoff),
+			zap.Error(evaluateErr),
+		)
+		time.Sleep(backoff)
+	}
+
+	if evaluateErr != nil {
 		workflowTriggers.WithLabelValues("check", "error").Inc()
-
-		// Clean up pending request on failure
-		s.requestsMutex.Lock()
-		delete(s.pendingRequests, trackingKey)
-		currentPending = len(s.pendingRequests)
-		s.requestsMutex.Unlock()
-		pendingRequestsGauge.Set(float64(currentPending))
-
-		// SECURITY: Don't expose internal error details to clients
-		http.Error(w, "Failed to trigger workflow", http.StatusInternalServerError)
+		s.logger.Error("CHECK failed to trigger evaluate workflow",
+			zap.String("domain", req.Domain),
+			zap.String("evaluate_domain", evaluateDomain),
+			zap.String("thold_hash", req.TholdHash),
+			zap.Error(evaluateErr),
+		)
+		if isRateLimitError(evaluateErr) {
+			http.Error(w, "Evaluate workflow rate-limited; retry shortly", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "Failed to trigger evaluate workflow", http.StatusInternalServerError)
+		}
 		return
 	}
 	workflowTriggers.WithLabelValues("check", "success").Inc()
 
-	// Block waiting for webhook or timeout
-	select {
-	case result := <-pending.ResultChan:
-		// Webhook arrived! Return result immediately
-		eventType := result.EventType
-		if eventType == "breach" {
-			logger.Info("BREACH detected - secret revealed",
+	deadline := time.Now().Add(s.config.BlockTimeout)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		updated, fetchErr := s.nostrClient.FetchQuoteByTholdHash(req.TholdHash)
+		if fetchErr != nil {
+			s.logger.Warn("CHECK polling fetch failed",
 				zap.String("domain", req.Domain),
+				zap.String("thold_hash", req.TholdHash),
+				zap.Error(fetchErr),
 			)
-		} else {
-			logger.Info("CHECK completed",
-				zap.String("domain", req.Domain),
-				zap.String("status", eventType),
-			)
+		} else if updated != nil {
+			if updated.CommitHash != "" {
+				s.quoteCache.SetQuote(updated.CommitHash, updated)
+			}
+
+			if updated.TholdKey != nil {
+				s.logger.Info("CHECK reveal observed",
+					zap.String("domain", req.Domain),
+					zap.String("thold_hash", req.TholdHash),
+					zap.String("commit_hash", updated.CommitHash),
+				)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(updated)
+				return
+			}
 		}
 
-		s.requestsMutex.Lock()
-		pending.Status = "completed"
-		pending.Result = result
-		s.requestsMutex.Unlock()
-
-		// Parse CRE response - already in core-ts PriceContract format
-		var priceContract PriceContractResponse
-		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
-			logger.Warn("Failed to parse content JSON",
-				zap.String("domain", req.Domain),
-				zap.Error(err),
-			)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"raw": result.Content})
-			return
+		if time.Now().After(deadline) {
+			break
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(priceContract)
-
-	case <-time.After(s.config.BlockTimeout):
-		// Timeout - return 202 with request_id for polling
-		requestTimeouts.WithLabelValues("check").Inc()
-		logger.Warn("CHECK request timeout",
-			zap.String("domain", req.Domain),
-			zap.String("request_id", trackingKey),
-			zap.Duration("timeout", s.config.BlockTimeout),
-		)
-
-		s.requestsMutex.Lock()
-		pending.Status = "timeout"
-		pending.TimedOut = true
-		s.requestsMutex.Unlock()
-
-		response := SyncResponse{
-			Status:    "timeout",
-			RequestID: trackingKey,
-			Message:   "Request is still processing. Use GET /status/" + trackingKey + " to check status.",
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted) // 202 Accepted
-		json.NewEncoder(w).Encode(response)
+		<-ticker.C
 	}
+
+	requestTimeouts.WithLabelValues("check").Inc()
+	s.logger.Warn("CHECK evaluate timeout waiting for reveal",
+		zap.String("domain", req.Domain),
+		zap.String("thold_hash", req.TholdHash),
+		zap.Duration("timeout", s.config.BlockTimeout),
+	)
+
+	response := SyncResponse{
+		Status:    "timeout",
+		RequestID: req.Domain,
+		Message:   "Evaluate triggered, but reveal was not observed before timeout.",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(response)
 }
 
 // handleWebhook receives POST callbacks from the CRE workflow and unblocks waiting requests.
@@ -1732,6 +2125,56 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		logger.Error("Failed to parse webhook JSON", zap.Error(err))
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Evaluate callbacks are JSON summaries (no signed Nostr content).
+	// Accept them for observability; reveal resolution still happens via relay polling in /check.
+	if payload.Content == "" && payload.EventType == "evaluate" && len(payload.Data) > 0 {
+		var evalPayload struct {
+			Summary struct {
+				Total    int `json:"total"`
+				Breached int `json:"breached"`
+				Active   int `json:"active"`
+				Errors   int `json:"errors"`
+			} `json:"summary"`
+			Results []struct {
+				TholdHash string  `json:"thold_hash"`
+				Status    string  `json:"status"`
+				Error     *string `json:"error"`
+				TholdKey  *string `json:"thold_key"`
+			} `json:"results"`
+		}
+
+		if err := json.Unmarshal(payload.Data, &evalPayload); err != nil {
+			logger.Warn("Failed to parse evaluate callback data",
+				zap.String("event_id", truncateEventID(payload.EventID)),
+				zap.Error(err),
+			)
+		} else {
+			firstError := ""
+			firstStatus := ""
+			if len(evalPayload.Results) > 0 {
+				firstStatus = evalPayload.Results[0].Status
+				if evalPayload.Results[0].Error != nil {
+					firstError = *evalPayload.Results[0].Error
+				}
+			}
+			logger.Info("Received evaluate callback summary",
+				zap.String("event_id", truncateEventID(payload.EventID)),
+				zap.String("domain", payload.Domain),
+				zap.Int("total", evalPayload.Summary.Total),
+				zap.Int("breached", evalPayload.Summary.Breached),
+				zap.Int("active", evalPayload.Summary.Active),
+				zap.Int("errors", evalPayload.Summary.Errors),
+				zap.String("first_status", firstStatus),
+				zap.String("first_error", firstError),
+			)
+		}
+
+		webhooksReceived.WithLabelValues(payload.EventType, "json_callback").Inc()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
 		return
 	}
 
@@ -1828,46 +2271,6 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// Mark webhook as processed AFTER all validations pass
 	s.markWebhookProcessed(payload.EventID)
 
-	// Republish ALL webhook events to relay so evaluate can find them later by commit_hash/thold_hash
-	go func(p WebhookPayload) {
-		event := &NostrEvent{
-			ID:        p.EventID,
-			PubKey:    p.PubKey,
-			CreatedAt: p.CreatedAt,
-			Kind:      p.Kind,
-			Tags:      p.Tags,
-			Content:   p.Content,
-			Sig:       p.Sig,
-		}
-		if err := s.nostrClient.PublishEvent(event); err != nil {
-			s.logger.Warn("Failed to republish event to relay",
-				zap.String("event_id", truncateEventID(p.EventID)),
-				zap.String("event_type", p.EventType),
-				zap.Error(err),
-			)
-		}
-	}(payload)
-
-	// Cache thold_hash -> commit_hash from webhook content for later evaluate resolution
-	if payload.Content != "" {
-		var webhookContent struct {
-			TholdHash  string `json:"thold_hash"`
-			CommitHash string `json:"commit_hash"`
-		}
-		if json.Unmarshal([]byte(payload.Content), &webhookContent) == nil {
-			if isValidHex(webhookContent.TholdHash, 40) && isValidHex(webhookContent.CommitHash, 64) {
-				if s.tholdToCommitCache == nil {
-					s.tholdToCommitCache = make(map[string]string)
-				}
-				s.tholdToCommitCache[webhookContent.TholdHash] = webhookContent.CommitHash
-				s.logger.Debug("Cached thold->commit mapping",
-					zap.String("thold_hash", webhookContent.TholdHash[:16]),
-					zap.String("commit_hash", webhookContent.CommitHash[:16]),
-				)
-			}
-		}
-	}
-
 	// Cache price data from webhook for the new quote flow
 	// Only update price cache for batch_generated events (from cron)
 	// On-demand "create" events should NOT overwrite the cron price because
@@ -1877,6 +2280,30 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("Cached price from batch_generated webhook",
 			zap.String("event_id", truncateEventID(payload.EventID)),
 		)
+
+		// Republish the signed event to the relay as redundancy.
+		// CRE publishes batches directly to the relay, but if that fails
+		// (which causes Nostr lookup misses), this ensures at least the
+		// webhook event makes it to the relay.
+		if s.nostrClient != nil && payload.EventID != "" && payload.Sig != "" {
+			go func(p WebhookPayload) {
+				event := &NostrEvent{
+					ID:        p.EventID,
+					PubKey:    p.PubKey,
+					CreatedAt: p.CreatedAt,
+					Kind:      p.Kind,
+					Tags:      p.Tags,
+					Content:   p.Content,
+					Sig:       p.Sig,
+				}
+				if err := s.nostrClient.PublishEvent(event); err != nil {
+					s.logger.Warn("Failed to republish batch event to relay",
+						zap.String("event_id", truncateEventID(p.EventID)),
+						zap.Error(err),
+					)
+				}
+			}(payload)
+		}
 	}
 
 	// SECURITY: Extract domain from tags to match pending request
@@ -1932,6 +2359,16 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}()
 		select {
 		case resultChan <- &payload:
+			// Persist result for status polling, including webhooks that arrive after
+			// the initial blocking request timed out.
+			s.requestsMutex.Lock()
+			if p, ok := s.pendingRequests[domain]; ok && p != nil {
+				p.Status = "completed"
+				p.Result = &payload
+				p.TimedOut = false
+			}
+			s.requestsMutex.Unlock()
+
 			webhooksReceived.WithLabelValues(payload.EventType, "matched").Inc()
 			logger.Info("Webhook received and matched",
 				zap.String("event_type", payload.EventType),
@@ -1952,7 +2389,16 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// handleStatus responds to GET /status/{request_id} with the current state of a tracked request.
+func extractStatusRequestID(path string) string {
+	for _, prefix := range []string{"/status/", "/api/status/"} {
+		if strings.HasPrefix(path, prefix) {
+			return strings.TrimPrefix(path, prefix)
+		}
+	}
+	return ""
+}
+
+// handleStatus responds to GET /status/{request_id} (or /api/status/{request_id}) with the current state of a tracked request.
 //
 // If the request exists and its status is "completed" and the webhook payload can be unmarshaled
 // into a PriceContractResponse, the handler returns that PriceContractResponse as JSON.
@@ -1968,7 +2414,7 @@ func (s *GatewayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestID := strings.TrimPrefix(r.URL.Path, "/status/")
+	requestID := extractStatusRequestID(r.URL.Path)
 	if requestID == "" {
 		http.Error(w, "Missing request_id", http.StatusBadRequest)
 		return
@@ -2081,19 +2527,7 @@ func (s *GatewayServer) handlePrice(w http.ResponseWriter, r *http.Request) {
 // Returns price in format: {"bitcoin": {"usd": 96000}}
 // Query params: ids (required), vs_currencies (required)
 func (s *GatewayServer) handleCoinGeckoPrice(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers - check if request origin is in allowed list
-	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
-	if allowedOrigins != "" {
-		origin := r.Header.Get("Origin")
-		for _, allowed := range strings.Split(allowedOrigins, ",") {
-			if origin == strings.TrimSpace(allowed) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	setCORSHeaders(w, r, "GET, OPTIONS")
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -2155,19 +2589,7 @@ func (s *GatewayServer) handleCoinGeckoPrice(w http.ResponseWriter, r *http.Requ
 // GET /api/price/latest - Ducat Protocol format price endpoint
 // Returns price in format: {"origin": "cre", "price": 96000, "stamp": 1768450624}
 func (s *GatewayServer) handlePriceLatest(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers - check if request origin is in allowed list
-	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
-	if allowedOrigins != "" {
-		origin := r.Header.Get("Origin")
-		for _, allowed := range strings.Split(allowedOrigins, ",") {
-			if origin == strings.TrimSpace(allowed) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	setCORSHeaders(w, r, "GET, OPTIONS")
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -2452,9 +2874,25 @@ func (s *GatewayServer) triggerWorkflow(op, domain string, tholdPrice *float64, 
 		return fmt.Errorf("non-success status %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	s.logger.Info("CRE workflow triggered successfully",
+		zap.String("operation", op),
+		zap.String("domain", domain),
+		zap.Int("status", resp.StatusCode),
+		zap.String("response", string(respBody)),
+	)
+
 	// Success - record it to potentially close the circuit
 	s.circuitBreaker.RecordSuccess()
 	return nil
+}
+
+// isRateLimitError returns true when CRE/gateway reported a rate-limit condition.
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errLower := strings.ToLower(err.Error())
+	return strings.Contains(errLower, "status 429") || strings.Contains(errLower, "rate limit")
 }
 
 // truncateEventID safely truncates an event ID to 16 characters for logging.
@@ -2613,6 +3051,80 @@ var (
 	)
 )
 
+
+const (
+	// evaluateHashTTL is how long a successfully-triggered commit_hash is
+	// remembered, preventing the liquidation poller from re-sending it.
+	evaluateHashTTL = 2 * time.Minute
+
+	// liqBackoffMax caps the exponential backoff for the liquidation poller
+	// when the CRE gateway returns 429 rate-limit errors.
+	liqBackoffMax = 5 * time.Minute
+)
+
+// filterRecentlyTriggered removes commit_hashes that were already triggered
+// within the evaluateHashTTL window. Also evicts expired entries.
+func (s *GatewayServer) filterRecentlyTriggered(hashes []string) []string {
+	s.recentEvaluateHashesMu.Lock()
+	defer s.recentEvaluateHashesMu.Unlock()
+
+	now := time.Now()
+	for h, t := range s.recentEvaluateHashes {
+		if now.Sub(t) > evaluateHashTTL {
+			delete(s.recentEvaluateHashes, h)
+		}
+	}
+
+	var filtered []string
+	for _, h := range hashes {
+		if _, ok := s.recentEvaluateHashes[h]; !ok {
+			filtered = append(filtered, h)
+		}
+	}
+	return filtered
+}
+
+// recordTriggeredHashes marks commit_hashes as recently triggered.
+func (s *GatewayServer) recordTriggeredHashes(hashes []string) {
+	s.recentEvaluateHashesMu.Lock()
+	defer s.recentEvaluateHashesMu.Unlock()
+	now := time.Now()
+	for _, h := range hashes {
+		s.recentEvaluateHashes[h] = now
+	}
+}
+
+// liqRecordRateLimit doubles the liquidation poller backoff (capped at liqBackoffMax).
+func (s *GatewayServer) liqRecordRateLimit() {
+	s.liqBackoffMu.Lock()
+	defer s.liqBackoffMu.Unlock()
+	if s.liqBackoffInterval == 0 {
+		s.liqBackoffInterval = s.config.LiquidationInterval * 2
+	} else {
+		s.liqBackoffInterval *= 2
+	}
+	if s.liqBackoffInterval > liqBackoffMax {
+		s.liqBackoffInterval = liqBackoffMax
+	}
+}
+
+// liqResetBackoff resets the liquidation poller to the normal interval.
+func (s *GatewayServer) liqResetBackoff() {
+	s.liqBackoffMu.Lock()
+	defer s.liqBackoffMu.Unlock()
+	s.liqBackoffInterval = 0
+}
+
+// liqCurrentInterval returns the current effective poll interval.
+func (s *GatewayServer) liqCurrentInterval() time.Duration {
+	s.liqBackoffMu.Lock()
+	defer s.liqBackoffMu.Unlock()
+	if s.liqBackoffInterval > 0 {
+		return s.liqBackoffInterval
+	}
+	return s.config.LiquidationInterval
+}
+
 // pollLiquidationService periodically polls the liquidation service for at-risk vaults.
 // It runs every config.LiquidationInterval (default 90 seconds) and logs at-risk vault info.
 // This allows the gateway to be aware of vaults that may need liquidation and can trigger
@@ -2626,15 +3138,15 @@ func (s *GatewayServer) pollLiquidationService() {
 	// Do an initial poll immediately
 	s.doLiquidationPoll()
 
-	ticker := time.NewTicker(s.config.LiquidationInterval)
-	defer ticker.Stop()
-
 	for {
+		interval := s.liqCurrentInterval()
+		timer := time.NewTimer(interval)
 		select {
 		case <-s.shutdownChan:
+			timer.Stop()
 			s.logger.Info("Liquidation poller received shutdown signal")
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			s.doLiquidationPoll()
 		}
 	}
@@ -2732,6 +3244,281 @@ func (s *GatewayServer) doLiquidationPoll() {
 	}
 }
 
+func dedupeHashes(hashes []string) []string {
+	if len(hashes) <= 1 {
+		return hashes
+	}
+	seen := make(map[string]struct{}, len(hashes))
+	unique := make([]string, 0, len(hashes))
+	for _, h := range hashes {
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		unique = append(unique, h)
+	}
+	return unique
+}
+
+func (s *GatewayServer) getNostrExistenceFromCache(hash string) (exists bool, ok bool) {
+	s.nostrExistenceMu.RLock()
+	entry, found := s.nostrExistenceCache[hash]
+	s.nostrExistenceMu.RUnlock()
+	if !found {
+		return false, false
+	}
+	if time.Since(entry.checkedAt) > s.config.NostrPrefilterCacheTTL {
+		return false, false
+	}
+	return entry.exists, true
+}
+
+func (s *GatewayServer) setNostrExistenceCache(hash string, exists bool) {
+	s.nostrExistenceMu.Lock()
+	defer s.nostrExistenceMu.Unlock()
+
+	if len(s.nostrExistenceCache) >= nostrExistenceCacheMaxSize {
+		// Evict one stale or arbitrary entry to keep memory bounded.
+		now := time.Now()
+		for k, v := range s.nostrExistenceCache {
+			if now.Sub(v.checkedAt) > s.config.NostrPrefilterCacheTTL {
+				delete(s.nostrExistenceCache, k)
+				break
+			}
+		}
+		if len(s.nostrExistenceCache) >= nostrExistenceCacheMaxSize {
+			for k := range s.nostrExistenceCache {
+				delete(s.nostrExistenceCache, k)
+				break
+			}
+		}
+	}
+
+	s.nostrExistenceCache[hash] = nostrExistenceEntry{
+		exists:    exists,
+		checkedAt: time.Now(),
+	}
+}
+
+// filterHashesExistingInNostr checks which thold_hashes have matching events on the
+// relay and returns:
+//   - filtered: the thold_hashes that have matching relay events
+//   - tholdToCommit: mapping from thold_hash → commit_hash (relay d-tag)
+//
+// The commit_hash mapping is essential because the CRE evaluate workflow looks up
+// events by d-tag, and relay d-tags are commit_hashes, not thold_hashes.
+func (s *GatewayServer) filterHashesExistingInNostr(hashes []string) (filtered []string, tholdToCommit map[string]string) {
+	tholdToCommit = make(map[string]string, len(hashes))
+
+	if len(hashes) == 0 || !s.config.NostrPrefilterEnabled {
+		return hashes, tholdToCommit
+	}
+	if s.nostrClient == nil {
+		s.logger.Warn("Nostr prefilter enabled but nostr client is nil",
+			zap.Bool("fail_closed", s.config.NostrPrefilterFailClosed),
+		)
+		if s.config.NostrPrefilterFailClosed {
+			return nil, tholdToCommit
+		}
+		return hashes, tholdToCommit
+	}
+
+	start := time.Now()
+	cacheHits := 0
+	relayMisses := 0
+	relayErrors := 0
+	includeByHash := make(map[string]bool, len(hashes))
+
+	uncached := make([]string, 0, len(hashes))
+	for _, raw := range hashes {
+		hash := strings.ToLower(strings.TrimSpace(raw))
+		if exists, ok := s.getNostrExistenceFromCache(hash); ok {
+			cacheHits++
+			includeByHash[hash] = exists
+			if !exists {
+				relayMisses++
+			}
+			continue
+		}
+		uncached = append(uncached, hash)
+	}
+
+	if len(uncached) > 0 {
+		commitToHashes := make(map[string][]string, len(uncached))
+
+		// Relay d-tags are commit_hash, while liquidation polling yields thold_hash.
+		// Resolve mappings first to avoid false misses during prefiltering.
+		resolvedCommits, err := s.nostrClient.ResolveCommitHashesByTholdHashes(uncached)
+		if err != nil {
+			s.logger.Warn("Nostr prefilter commit-hash resolution failed; falling back to direct d-tag lookups",
+				zap.Error(err),
+				zap.Int("batch_size", len(uncached)),
+			)
+			for _, hash := range uncached {
+				commitToHashes[hash] = append(commitToHashes[hash], hash)
+			}
+		} else {
+			for _, hash := range uncached {
+				commitHash, ok := resolvedCommits[hash]
+				if !ok {
+					// Fallback-open for unresolved hashes: continue evaluating rather than
+					// dropping potentially valid vaults due to relay scan window limits.
+					includeByHash[hash] = true
+					s.setNostrExistenceCache(hash, true)
+					continue
+				}
+				commitToHashes[commitHash] = append(commitToHashes[commitHash], hash)
+				// Store the thold→commit mapping for CRE evaluate
+				tholdToCommit[hash] = commitHash
+			}
+
+			if unresolved := len(uncached) - len(resolvedCommits); unresolved > 0 {
+				s.logger.Warn("Nostr prefilter unresolved thold->commit mappings; allowing evaluate fallback",
+					zap.Int("unresolved_hashes", unresolved),
+					zap.Int("input_hashes", len(uncached)),
+				)
+			}
+		}
+
+		commitHashes := make([]string, 0, len(commitToHashes))
+		for commitHash := range commitToHashes {
+			commitHashes = append(commitHashes, commitHash)
+		}
+
+		// strfry batch endpoint supports max 1000 d_tags per request.
+		const relayBatchSize = 1000
+
+		for i := 0; i < len(commitHashes); i += relayBatchSize {
+			end := i + relayBatchSize
+			if end > len(commitHashes) {
+				end = len(commitHashes)
+			}
+			batch := commitHashes[i:end]
+
+			existsByTag, perTagErrors, batchErr := s.nostrClient.QuoteExistsByDTagBatch(batch)
+			if batchErr != nil {
+				relayErrors += len(batch)
+				s.logger.Warn("Nostr prefilter batch lookup failed",
+					zap.Error(batchErr),
+					zap.Int("batch_size", len(batch)),
+					zap.Bool("fail_closed", s.config.NostrPrefilterFailClosed),
+				)
+				for _, commitHash := range batch {
+					for _, hash := range commitToHashes[commitHash] {
+						includeByHash[hash] = !s.config.NostrPrefilterFailClosed
+					}
+				}
+				continue
+			}
+
+			for _, commitHash := range batch {
+				hashGroup := commitToHashes[commitHash]
+
+				if tagErr, ok := perTagErrors[commitHash]; ok {
+					relayErrors++
+					s.logger.Debug("Nostr prefilter d-tag lookup error",
+						zap.String("commit_hash", commitHash),
+						zap.Error(tagErr),
+						zap.Bool("fail_closed", s.config.NostrPrefilterFailClosed),
+					)
+					for _, hash := range hashGroup {
+						includeByHash[hash] = !s.config.NostrPrefilterFailClosed
+					}
+					continue
+				}
+
+				exists := existsByTag[commitHash]
+				for _, hash := range hashGroup {
+					s.setNostrExistenceCache(hash, exists)
+					includeByHash[hash] = exists
+					if !exists {
+						relayMisses++
+					}
+				}
+			}
+		}
+	}
+	filtered = make([]string, 0, len(hashes))
+	for _, raw := range hashes {
+		hash := strings.ToLower(strings.TrimSpace(raw))
+		if includeByHash[hash] {
+			filtered = append(filtered, hash)
+		}
+	}
+
+	logFn := s.logger.Info
+	if relayErrors > 0 {
+		logFn = s.logger.Warn
+	}
+	logFn("Nostr prefilter complete",
+		zap.Int("input_hashes", len(hashes)),
+		zap.Int("filtered_hashes", len(filtered)),
+		zap.Int("resolved_commit_hashes", len(tholdToCommit)),
+		zap.Int("relay_misses", relayMisses),
+		zap.Int("relay_errors", relayErrors),
+		zap.Bool("fail_closed", s.config.NostrPrefilterFailClosed),
+		zap.Int("cache_hits", cacheHits),
+		zap.Duration("duration", time.Since(start)),
+	)
+
+	return filtered, tholdToCommit
+}
+
+func (s *GatewayServer) splitNewAtRiskHashes(hashes []string) (newHashes []string, existingHashes []string) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+
+	s.liquidationSeenMu.Lock()
+	defer s.liquidationSeenMu.Unlock()
+
+	current := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		current[h] = struct{}{}
+	}
+
+	if !s.liquidationSeenInitialized {
+		s.liquidationSeenHashes = current
+		s.liquidationSeenInitialized = true
+		return nil, append([]string(nil), hashes...)
+	}
+
+	newHashes = make([]string, 0)
+	existingHashes = make([]string, 0, len(hashes))
+	for _, h := range hashes {
+		if _, ok := s.liquidationSeenHashes[h]; ok {
+			existingHashes = append(existingHashes, h)
+		} else {
+			newHashes = append(newHashes, h)
+		}
+	}
+
+	s.liquidationSeenHashes = current
+	return newHashes, existingHashes
+}
+
+func (s *GatewayServer) takeRotatingHashes(hashes []string, count int) []string {
+	if count <= 0 || len(hashes) == 0 {
+		return nil
+	}
+
+	if count >= len(hashes) {
+		return append([]string(nil), hashes...)
+	}
+
+	s.liquidationSelectionMu.Lock()
+	start := s.liquidationSelectionCursor % len(hashes)
+	s.liquidationSelectionCursor = (start + count) % len(hashes)
+	s.liquidationSelectionMu.Unlock()
+
+	selected := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		idx := (start + i) % len(hashes)
+		selected = append(selected, hashes[idx])
+	}
+	return selected
+}
+
 // triggerCheckForAtRiskVaults triggers the CRE "evaluate" workflow with all thold_hashes in a single request.
 // This will cause the oracle to check if any prices have breached their thresholds and reveal
 // the thold_key if so. The breach events are published to Nostr and picked up by the liquidation service.
@@ -2743,117 +3530,71 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 		return
 	}
 
-	// Resolve thold_hashes to commit_hashes.
-	// Strategy 1: Search the relay for existing events containing each thold_hash.
-	// Strategy 2: For unresolved hashes, compute commit_hash from cached price (may not match
-	//             if the vault was opened at a different price, but lets CRE try).
-	var uniqueTholdHashes []string
-	seen := make(map[string]bool)
+	// Collect all valid thold_hashes
+	var tholdHashes []string
 	for _, vault := range vaults {
+		// Skip if thold_hash is empty or invalid (must be 40 hex chars)
+		// Use isValidHex to prevent injection attacks via malformed data
 		if !isValidHex(vault.TholdHash, 40) {
+			s.logger.Debug("Skipping vault with invalid thold_hash",
+				zap.String("vault_id", vault.VaultID),
+				zap.String("thold_hash", vault.TholdHash),
+			)
 			continue
 		}
-		if !seen[vault.TholdHash] {
-			seen[vault.TholdHash] = true
-			uniqueTholdHashes = append(uniqueTholdHashes, vault.TholdHash)
-		}
+		tholdHashes = append(tholdHashes, vault.TholdHash)
 	}
 
-	if len(uniqueTholdHashes) == 0 {
+	if len(tholdHashes) == 0 {
 		s.logger.Debug("No valid thold_hashes to evaluate")
 		return
 	}
 
-	// Strategy 0: Check in-memory cache from previous create/batch webhooks
-	resolved := make(map[string]string)
-	var unresolvedHashes []string
-	for _, th := range uniqueTholdHashes {
-		if ch, ok := s.tholdToCommitCache[th]; ok {
-			resolved[th] = ch
-		} else {
-			unresolvedHashes = append(unresolvedHashes, th)
-		}
-	}
-
-	// Strategy 1: Relay lookup for remaining unresolved hashes
-	if len(unresolvedHashes) > 0 {
-		relayResolved, err := s.nostrClient.ResolveCommitHashesByTholdHashes(unresolvedHashes)
-		if err != nil {
-			s.logger.Warn("Relay thold->commit resolution failed", zap.Error(err))
-		} else {
-			for k, v := range relayResolved {
-				resolved[k] = v
-			}
-		}
-	}
-
-
-	// Strategy 2: Local computation fallback for unresolved hashes
-	cachedPrice := s.quoteCache.GetPrice()
-	commitSeen := make(map[string]bool)
-	var commitHashes []string
-	for _, th := range uniqueTholdHashes {
-		if ch, ok := resolved[th]; ok && ch != "" {
-			if !commitSeen[ch] {
-				commitSeen[ch] = true
-				commitHashes = append(commitHashes, ch)
-			}
-			continue
-		}
-		// Fallback: compute from cached price
-		if cachedPrice == nil {
-			continue
-		}
-		// Find thold_price for this hash from vault data
-		var tholdPrice float64
-		for _, v := range vaults {
-			if v.TholdHash == th {
-				tholdPrice = v.TholdPrice
-				break
-			}
-		}
-		if tholdPrice == 0 {
-			continue
-		}
-		ch, cerr := CalculateCommitHash(
-			s.config.OraclePubkey,
-			s.config.ChainNetwork,
-			cachedPrice.BasePrice,
-			cachedPrice.BaseStamp,
-			uint32(tholdPrice),
+	// Remove duplicates before any external calls.
+	originalCount := len(tholdHashes)
+	tholdHashes = dedupeHashes(tholdHashes)
+	duplicateCount := originalCount - len(tholdHashes)
+	if duplicateCount > 0 {
+		s.logger.Info("Deduplicated thold_hashes before CRE evaluate",
+			zap.Int("input_hashes", originalCount),
+			zap.Int("unique_hashes", len(tholdHashes)),
+			zap.Int("duplicates_removed", duplicateCount),
 		)
-		if cerr != nil {
-			continue
-		}
-		if !commitSeen[ch] {
-			commitSeen[ch] = true
-			commitHashes = append(commitHashes, ch)
-		}
 	}
 
-	if len(commitHashes) == 0 {
-		s.logger.Info("No commit_hashes resolved for CRE evaluate",
-			zap.Int("thold_hashes", len(uniqueTholdHashes)),
+	// Dev CRE uses #h tags for thold_hash lookups, so we can send thold_hashes directly.
+	evaluateHashes := tholdHashes
+
+	if s.config.LiquidationMaxHashesPerPoll > 0 && len(evaluateHashes) > s.config.LiquidationMaxHashesPerPoll {
+		// Rotate through hashes each cycle so all eventually get evaluated
+		offset := int(time.Now().UnixNano() / int64(time.Second)) % len(evaluateHashes)
+		var rotated []string
+		rotated = append(rotated, evaluateHashes[offset:]...)
+		rotated = append(rotated, evaluateHashes[:offset]...)
+		evaluateHashes = rotated[:s.config.LiquidationMaxHashesPerPoll]
+	}
+
+	const batchSize = 500
+	totalVaults := len(evaluateHashes)
+	numBatches := (totalVaults + batchSize - 1) / batchSize
+
+	// Cross-poll dedup: skip hashes that were already triggered recently.
+	beforeDedup := len(evaluateHashes)
+	evaluateHashes = s.filterRecentlyTriggered(evaluateHashes)
+	if skipped := beforeDedup - len(evaluateHashes); skipped > 0 {
+		s.logger.Info("Skipped recently-triggered evaluate hashes",
+			zap.Int("skipped", skipped),
+			zap.Int("remaining", len(evaluateHashes)),
+			zap.Duration("ttl", evaluateHashTTL),
 		)
+	}
+	if len(evaluateHashes) == 0 {
+		s.logger.Info("All evaluate hashes recently triggered; skipping CRE evaluate this cycle")
 		return
 	}
 
-	s.logger.Info("Resolved thold_hashes to commit_hashes",
-		zap.Int("input_thold_hashes", len(uniqueTholdHashes)),
-		zap.Int("relay_resolved", len(resolved)),
-		zap.Int("unique_commit_hashes", len(commitHashes)),
-	)
-
-	tholdHashes := commitHashes
-
-	// CRE has a 30KB maximum request size limit (including headers and body).
-	// Each thold_hash is ~45 bytes (40 hex chars + JSON overhead).
-	// With JSON-RPC wrapper overhead (~500 bytes), we can fit ~650 vaults max.
-	// Using 500 per batch for safety margin.
-	const batchSize = 500
-
-	totalVaults := len(tholdHashes)
-	numBatches := (totalVaults + batchSize - 1) / batchSize
+	totalVaults = len(evaluateHashes)
+	numBatches = (totalVaults + batchSize - 1) / batchSize
 
 	s.logger.Info("Triggering CRE evaluate for at-risk vaults",
 		zap.Int("total_vaults", totalVaults),
@@ -2863,13 +3604,14 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 
 	successCount := 0
 	errorCount := 0
+	hitRateLimit := false
 
 	for i := 0; i < totalVaults; i += batchSize {
 		end := i + batchSize
 		if end > totalVaults {
 			end = totalVaults
 		}
-		batch := tholdHashes[i:end]
+		batch := evaluateHashes[i:end]
 		batchNum := (i / batchSize) + 1
 
 		// Generate a unique domain for this batch
@@ -2885,6 +3627,14 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 			)
 			errorCount++
 			liquidationCheckTriggers.WithLabelValues("error").Inc()
+			if isRateLimitError(err) {
+				hitRateLimit = true
+				s.logger.Warn("CRE rate limit detected; aborting remaining evaluate batches",
+					zap.Int("batch", batchNum),
+					zap.Int("remaining_batches", numBatches-batchNum),
+				)
+				break
+			}
 		} else {
 			s.logger.Info("Triggered evaluate workflow batch",
 				zap.Int("batch", batchNum),
@@ -2894,6 +3644,7 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 			)
 			successCount++
 			liquidationCheckTriggers.WithLabelValues("success").Inc()
+			s.recordTriggeredHashes(batch)
 		}
 
 		// Delay between batches to avoid CRE rate limits (429 errors observed at 500ms)
@@ -2901,6 +3652,16 @@ func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
 		if end < totalVaults {
 			time.Sleep(10 * time.Second)
 		}
+	}
+
+	// Update liquidation poller backoff based on this cycle's outcome.
+	if hitRateLimit {
+		s.liqRecordRateLimit()
+		s.logger.Warn("Liquidation poller backing off due to CRE rate limit",
+			zap.Duration("next_interval", s.liqCurrentInterval()),
+		)
+	} else if successCount > 0 {
+		s.liqResetBackoff()
 	}
 
 	s.logger.Info("Completed triggering evaluate workflow batches",

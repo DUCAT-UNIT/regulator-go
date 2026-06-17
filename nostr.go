@@ -118,7 +118,7 @@ func (c *NostrClient) FetchQuoteByDTag(dtag string) (*PriceContractResponse, err
 // IMPORTANT: Tag must match cre-hmac/crypto/crypto.go TagPriceCommitHash
 func CalculateCommitHash(oraclePubkey, chainNetwork string, basePrice, baseStamp, tholdPrice uint32) (string, error) {
 	// BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
-	tag := "ducat/price_commit_hash"
+	tag := "ducat/price_contract_commit"
 	tagHash := sha256.Sum256([]byte(tag))
 
 	// Decode oracle pubkey from hex

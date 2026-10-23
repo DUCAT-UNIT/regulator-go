@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for DUCAT Regulator Gateway Server
 # Stage 1: Builder
-FROM golang:1.24-alpine AS builder
+FROM golang:1.27.3-alpine3.24 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates tzdata
@@ -27,7 +27,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     .
 
 # Stage 2: Runtime
-FROM alpine:3.19
+FROM alpine:3.24
 
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates curl
